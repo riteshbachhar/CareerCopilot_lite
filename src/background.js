@@ -21,6 +21,12 @@ import {
 import { extractJobPostingFromPage } from './adapters/json-ld.js';
 import { parseProfileMarkdown } from './profile/parse-markdown.js';
 import { computeMatch } from './match.js';
+import { cleanupJd, testGroqConnection } from './llm/groq-client.js';
+import {
+  getLlmSettings,
+  setLlmSettings,
+  clearLlmSettings,
+} from './llm/settings.js';
 
 const OFFSCREEN_URL = 'offscreen.html';
 
@@ -153,7 +159,13 @@ async function persistCapture({
   await putEmbedding({ jd_id: row.id, vector, dims });
   await computeAndPersistMatch(row.id, vector);
 
-  return { id: row.id, coldStartMs, embedMs, title: row.title, company: row.company };
+  return {
+    id: row.id,
+    coldStartMs,
+    embedMs,
+    title: row.title,
+    company: row.company,
+  };
 }
 
 function firstLineAsTitle(text) {
@@ -310,6 +322,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         };
         if ('notes' in patch) changes.notes = patch.notes ?? null;
         if ('follow_up_at' in patch) changes.follow_up_at = patch.follow_up_at ?? null;
+        // Invalidate cached LLM cleanup when raw_text changed — the cleaned
+        // version is stale once the source text moves.
+        if (nextRawText !== existing.raw_text) {
+          changes.cleaned_text = null;
+          changes.cleaned_at = null;
+        }
 
         let vector = null;
         if (embedDirty) {
@@ -520,6 +538,103 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           updated: done,
           total: stale.length,
           profile_version: profileVersion,
+        });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'get-llm-settings') {
+    (async () => {
+      try {
+        const settings = await getLlmSettings();
+        // Don't ship the full key back to the side panel by default; expose
+        // a hasKey hint and the last 4 chars so the UI can confirm a key is
+        // saved without splashing it across the DOM.
+        const { apiKey, ...rest } = settings;
+        sendResponse({
+          ok: true,
+          settings: {
+            ...rest,
+            hasKey: !!apiKey,
+            keyTail: apiKey ? apiKey.slice(-4) : '',
+          },
+        });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'set-llm-settings') {
+    (async () => {
+      try {
+        const next = await setLlmSettings(msg.patch ?? {});
+        const { apiKey, ...rest } = next;
+        sendResponse({
+          ok: true,
+          settings: {
+            ...rest,
+            hasKey: !!apiKey,
+            keyTail: apiKey ? apiKey.slice(-4) : '',
+          },
+        });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'clear-llm-settings') {
+    (async () => {
+      try {
+        await clearLlmSettings();
+        sendResponse({ ok: true });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'test-llm-connection') {
+    (async () => {
+      try {
+        const settings = await getLlmSettings();
+        const result = await testGroqConnection(settings);
+        sendResponse({ ok: true, result });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'cleanup-job') {
+    (async () => {
+      try {
+        const { id } = msg;
+        const row = await getJob(id);
+        if (!row) throw new Error(`job not found: ${id}`);
+        const settings = await getLlmSettings();
+        const out = await cleanupJd({ rawText: row.raw_text, settings });
+        if (!out.cleanedText) {
+          sendResponse({ ok: true, cleaned: false, info: out });
+          return;
+        }
+        const next = await updateJob(id, {
+          cleaned_text: out.cleanedText,
+          cleaned_at: Date.now(),
+        });
+        sendResponse({
+          ok: true,
+          cleaned: true,
+          latencyMs: out.latencyMs,
+          job: next,
         });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });

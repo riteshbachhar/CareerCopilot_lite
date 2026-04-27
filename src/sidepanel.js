@@ -14,6 +14,7 @@ const $ = (id) => document.getElementById(id);
 const backBtn = $('back-btn');
 const toolbarTitle = $('toolbar-title');
 const openProfileBtn = $('open-profile');
+const openSettingsBtn = $('open-settings');
 
 // Library view
 const libraryView = $('library-view');
@@ -55,6 +56,19 @@ const exportJsonBtn = $('export-json');
 const exportRedact = $('export-redact');
 const exportStatus = $('export-status');
 
+// Settings drawer
+const settingsBackdrop = $('settings-backdrop');
+const settingsDrawer = $('settings-drawer');
+const closeSettingsBtn = $('close-settings');
+const settingsApiKey = $('settings-api-key');
+const settingsKeyStatus = $('settings-key-status');
+const settingsModel = $('settings-model');
+const settingsEnabled = $('settings-enabled');
+const settingsSave = $('settings-save');
+const settingsTest = $('settings-test');
+const settingsClear = $('settings-clear');
+const settingsStatus = $('settings-status');
+
 // ---------- State ----------
 
 let currentView = 'library';
@@ -64,6 +78,12 @@ let currentJobMatchFacts = null;
 let isEditMode = false;
 let cachedJobs = [];
 let currentProfileVersion = null;
+// Cached so we can show/hide the "Clean up JD" button without asking the
+// background on every detail render. Refreshed on settings save.
+let llmEnabledHasKey = false;
+// Per-detail-view toggle for which body the user wants to read. Reset on
+// every navigation to a detail view; defaults to 'cleaned' when available.
+let bodyViewMode = 'cleaned';
 
 // ---------- Helpers ----------
 
@@ -202,7 +222,9 @@ function formatSalaryChip(salary) {
 function renderFieldChips(job) {
   const sf = job.structured_fields ?? {};
   const chips = [];
-  if (sf.employment_type) chips.push(String(sf.employment_type).toLowerCase().replace(/_/g, ' '));
+  if (sf.employment_type) {
+    chips.push(String(sf.employment_type).toLowerCase().replace(/_/g, ' '));
+  }
   if (sf.remote) chips.push(sf.remote);
   if (sf.seniority) chips.push(sf.seniority);
   const salary = formatSalaryChip(sf.salary);
@@ -213,6 +235,107 @@ function renderFieldChips(job) {
   }
   if (!chips.length) return '';
   return `<div class="field-chips">${chips.map((c) => `<span class="field-chip">${escapeHtml(c)}</span>`).join('')}</div>`;
+}
+
+// Restricted to http(s) so a malformed or hostile `url` field cannot
+// become a javascript: URI when used in an href.
+function safeJobUrl(job) {
+  if (!job.url) return null;
+  let parsed;
+  try {
+    parsed = new URL(job.url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  return { href: parsed.href, host: parsed.host.replace(/^www\./, '') };
+}
+
+// Detail-view link: full text, sits under the meta line.
+function renderJobUrlLink(job) {
+  const u = safeJobUrl(job);
+  if (!u) return '';
+  return `<a class="job-url-link" href="${escapeHtml(u.href)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(u.href)}">Open at ${escapeHtml(u.host)} ↗</a>`;
+}
+
+// List-row link: icon-only so it doesn't crowd the actions strip. Lives
+// inside .row-actions so the row's click-to-open handler ignores it.
+function renderRowUrlLink(job) {
+  const u = safeJobUrl(job);
+  if (!u) return '';
+  return `<a class="row-url-link" href="${escapeHtml(u.href)}" target="_blank" rel="noopener noreferrer" title="open ${escapeHtml(u.host)}" aria-label="open original posting">↗</a>`;
+}
+
+// Tiny markdown renderer for cleaned JD bodies. Handles the subset the
+// cleanup prompt is asked to produce: ## headings, - bullet lists, blank-line
+// paragraphs. Everything is escapeHtml'd FIRST — never trust LLM output to
+// be HTML-safe.
+function renderCleanedMarkdown(md) {
+  const safe = escapeHtml(md ?? '');
+  const lines = safe.split('\n');
+  const out = [];
+  let i = 0;
+  let para = [];
+  const flushPara = () => {
+    if (para.length) {
+      out.push(`<p>${para.join(' ')}</p>`);
+      para = [];
+    }
+  };
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushPara();
+      i += 1;
+      continue;
+    }
+    const h = /^(#{1,6})\s+(.*)$/.exec(trimmed);
+    if (h) {
+      flushPara();
+      const level = Math.min(h[1].length + 2, 6); // ## → h4 in our scale
+      out.push(`<h${level}>${h[2]}</h${level}>`);
+      i += 1;
+      continue;
+    }
+    if (/^[-*]\s+/.test(trimmed)) {
+      flushPara();
+      const items = [];
+      while (i < lines.length && /^[-*]\s+/.test(lines[i].trim())) {
+        items.push(`<li>${lines[i].trim().replace(/^[-*]\s+/, '')}</li>`);
+        i += 1;
+      }
+      out.push(`<ul>${items.join('')}</ul>`);
+      continue;
+    }
+    para.push(trimmed);
+    i += 1;
+  }
+  flushPara();
+  return out.join('');
+}
+
+function renderJobBody(job) {
+  const hasCleaned = !!(job.cleaned_text && String(job.cleaned_text).trim());
+  if (!hasCleaned) {
+    return `<div class="detail-body">${escapeHtml(job.raw_text ?? '')}</div>`;
+  }
+  const showingCleaned = bodyViewMode !== 'original';
+  const cleanedAt = job.cleaned_at
+    ? `cleaned ${escapeHtml(formatRelativeTime(job.cleaned_at))}`
+    : '';
+  const toggle = `
+    <div class="body-toggle">
+      <span>View:</span>
+      <button class="body-toggle-btn ${showingCleaned ? 'active' : ''}" data-mode="cleaned" type="button">cleaned ✨</button>
+      <button class="body-toggle-btn ${!showingCleaned ? 'active' : ''}" data-mode="original" type="button">original</button>
+      <span class="body-toggle-meta">${cleanedAt}</span>
+    </div>
+  `;
+  const bodyHtml = showingCleaned
+    ? `<div class="detail-body cleaned">${renderCleanedMarkdown(job.cleaned_text)}</div>`
+    : `<div class="detail-body">${escapeHtml(job.raw_text ?? '')}</div>`;
+  return `${toggle}${bodyHtml}`;
 }
 
 function renderNotesBlock(job) {
@@ -266,6 +389,7 @@ function renderRowActions(job) {
       ${picker}
       ${renderMatchChip(job)}
       ${renderFollowUpChip(job)}
+      ${renderRowUrlLink(job)}
       ${renderDeleteBtn(job)}
     </div>
   `;
@@ -564,22 +688,27 @@ function renderDetail() {
     return;
   }
 
+  const cleanupBtn = llmEnabledHasKey
+    ? `<button class="cleanup-btn" type="button" title="ask the LLM to reorganize the JD into clean sections">Clean up JD ✨</button>`
+    : '';
   detailContent.innerHTML = `
     <div class="detail-header" data-status="${escapeHtml(status)}">
       <div class="detail-meta">${escapeHtml(metaLine)}</div>
+      ${renderJobUrlLink(job)}
       ${renderFieldChips(job)}
       <div class="detail-actions">
         ${renderStatusPicker(job)}
         ${renderMatchChip(job)}
         ${renderFollowUpChip(job)}
         <button class="edit-detail-btn" type="button">Edit</button>
+        ${cleanupBtn}
         ${renderDeleteBtn(job)}
       </div>
       ${renderStatusTimeline(job)}
     </div>
     ${renderNotesBlock(job)}
     <div class="detail-section-label">Job description</div>
-    <div class="detail-body">${escapeHtml(job.raw_text ?? '')}</div>
+    ${renderJobBody(job)}
     ${renderMatchSection()}
   `;
 }
@@ -609,6 +738,7 @@ async function showDetail(jobId) {
     currentProfileVersion = resp.profile_version ?? currentProfileVersion;
     currentView = 'detail';
     isEditMode = false;
+    bodyViewMode = 'cleaned';
     libraryView.hidden = true;
     detailView.hidden = false;
     backBtn.hidden = false;
@@ -639,9 +769,128 @@ openProfileBtn.addEventListener('click', openProfile);
 closeProfileBtn.addEventListener('click', closeProfile);
 profileBackdrop.addEventListener('click', closeProfile);
 
+// ---------- Settings drawer ----------
+
+async function refreshSettingsDrawer() {
+  try {
+    const resp = await send('get-llm-settings');
+    if (!resp?.ok) return;
+    const s = resp.settings;
+    llmEnabledHasKey = !!(s.hasKey && s.enabled);
+    settingsModel.value = s.model || 'llama-3.1-8b-instant';
+    settingsEnabled.checked = !!s.enabled;
+    if (s.hasKey) {
+      settingsApiKey.value = '';
+      settingsApiKey.placeholder = `••••••${s.keyTail || ''} (saved)`;
+      settingsKeyStatus.textContent = `key saved (…${s.keyTail || ''})`;
+      settingsKeyStatus.className = 'status';
+    } else {
+      settingsApiKey.placeholder = 'gsk_…';
+      settingsKeyStatus.textContent = '';
+    }
+  } catch {
+    // ignore — background may be warming up
+  }
+}
+
+function openSettings() {
+  settingsDrawer.hidden = false;
+  settingsBackdrop.hidden = false;
+  settingsStatus.textContent = '';
+  settingsStatus.className = 'status';
+  refreshSettingsDrawer();
+}
+function closeSettings() {
+  settingsDrawer.hidden = true;
+  settingsBackdrop.hidden = true;
+}
+
+openSettingsBtn.addEventListener('click', openSettings);
+closeSettingsBtn.addEventListener('click', closeSettings);
+settingsBackdrop.addEventListener('click', closeSettings);
+
+settingsSave.addEventListener('click', async () => {
+  settingsSave.disabled = true;
+  settingsStatus.className = 'status';
+  settingsStatus.textContent = 'saving…';
+  const patch = {
+    model: settingsModel.value,
+    enabled: settingsEnabled.checked,
+  };
+  // Only update the key when the user typed a new one — empty input means
+  // "leave the saved key alone."
+  const typed = settingsApiKey.value.trim();
+  if (typed) patch.apiKey = typed;
+  try {
+    const resp = await send('set-llm-settings', { patch });
+    if (!resp?.ok) throw new Error(resp?.error ?? 'save failed');
+    settingsStatus.textContent = 'saved';
+    settingsApiKey.value = '';
+    await refreshSettingsDrawer();
+    // Detail-view Re-structure button visibility may have changed.
+    if (currentView === 'detail') renderDetail();
+  } catch (err) {
+    settingsStatus.className = 'status error';
+    settingsStatus.textContent = `error: ${String(err?.message ?? err)}`;
+  } finally {
+    settingsSave.disabled = false;
+  }
+});
+
+settingsTest.addEventListener('click', async () => {
+  settingsTest.disabled = true;
+  settingsStatus.className = 'status';
+  settingsStatus.textContent = 'testing…';
+  try {
+    // If the user typed a new key but hasn't saved, save it transiently
+    // first — otherwise the test would use the old key.
+    const typed = settingsApiKey.value.trim();
+    if (typed) {
+      await send('set-llm-settings', {
+        patch: { apiKey: typed, model: settingsModel.value, enabled: settingsEnabled.checked },
+      });
+      settingsApiKey.value = '';
+      await refreshSettingsDrawer();
+    }
+    const resp = await send('test-llm-connection');
+    if (!resp?.ok) throw new Error(resp?.error ?? 'test failed');
+    const r = resp.result;
+    if (r.ok) {
+      settingsStatus.textContent = `ok · ${r.latencyMs}ms`;
+    } else {
+      settingsStatus.className = 'status error';
+      settingsStatus.textContent = `failed: ${r.error}`;
+    }
+  } catch (err) {
+    settingsStatus.className = 'status error';
+    settingsStatus.textContent = `error: ${String(err?.message ?? err)}`;
+  } finally {
+    settingsTest.disabled = false;
+  }
+});
+
+settingsClear.addEventListener('click', async () => {
+  if (!confirm('Clear LLM settings and API key? This cannot be undone.')) return;
+  settingsClear.disabled = true;
+  try {
+    const resp = await send('clear-llm-settings');
+    if (!resp?.ok) throw new Error(resp?.error ?? 'clear failed');
+    settingsStatus.className = 'status';
+    settingsStatus.textContent = 'cleared';
+    await refreshSettingsDrawer();
+    if (currentView === 'detail') renderDetail();
+  } catch (err) {
+    settingsStatus.className = 'status error';
+    settingsStatus.textContent = `error: ${String(err?.message ?? err)}`;
+  } finally {
+    settingsClear.disabled = false;
+  }
+});
+
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (!profileDrawer.hidden) return closeProfile();
+  if (!settingsDrawer.hidden) return closeSettings();
 });
 
 // ---------- Shared row actions (status picker + delete) ----------
@@ -728,8 +977,62 @@ detailContent.addEventListener('click', (event) => {
   if (t.classList.contains('edit-detail-btn')) return handleEditClick();
   if (t.classList.contains('save-btn')) return handleSaveClick(event);
   if (t.classList.contains('cancel-btn')) return handleCancelClick();
+  if (t.classList.contains('cleanup-btn')) return handleCleanupClick();
+  if (t.classList.contains('body-toggle-btn')) return handleBodyToggleClick(t);
   if (t.id === 'recompute-match-btn') return handleRecomputeMatchClick();
 });
+
+function handleBodyToggleClick(btn) {
+  const mode = btn.dataset.mode;
+  if (!mode) return;
+  bodyViewMode = mode;
+  renderDetail();
+}
+
+async function handleCleanupClick() {
+  if (!currentJobId) return;
+  const btn = detailContent.querySelector('.cleanup-btn');
+  if (!btn) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'cleaning…';
+  try {
+    const resp = await send('cleanup-job', { id: currentJobId });
+    if (!resp?.ok) throw new Error(resp?.error ?? 'cleanup failed');
+    if (!resp.cleaned) {
+      const reason =
+        resp.info?.skipped
+          ? `skipped (${resp.info.skipped})`
+          : resp.info?.error
+          ? `error: ${resp.info.error}`
+          : 'no result';
+      const prevTitle = toolbarTitle.textContent;
+      toolbarTitle.textContent = `cleanup ${reason}`;
+      setTimeout(() => { toolbarTitle.textContent = prevTitle; }, 2400);
+      return;
+    }
+    if (resp.job) {
+      currentJobFull = resp.job;
+    } else {
+      const get = await send('get', { id: currentJobId });
+      if (get?.ok && get.job) currentJobFull = get.job;
+    }
+    bodyViewMode = 'cleaned';
+    renderDetail();
+    const prevTitle = toolbarTitle.textContent;
+    toolbarTitle.textContent = `cleaned · ${resp.latencyMs ?? '?'}ms`;
+    setTimeout(() => { toolbarTitle.textContent = prevTitle; }, 2200);
+  } catch (err) {
+    console.error('[cleanup] failed', err);
+    alert(`Clean up failed: ${String(err?.message ?? err)}`);
+  } finally {
+    const after = detailContent.querySelector('.cleanup-btn');
+    if (after) {
+      after.disabled = false;
+      after.textContent = original;
+    }
+  }
+}
 
 function handleEditClick() {
   isEditMode = true;
@@ -1189,4 +1492,5 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 populateSortDropdown();
 refreshProfileSummary();
+refreshSettingsDrawer();
 refreshJobs();

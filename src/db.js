@@ -86,6 +86,8 @@ export async function addJob({
     company: company ?? null,
     timestamp: now,
     raw_text,
+    cleaned_text: null,
+    cleaned_at: null,
     structured_fields: structured_fields ?? null,
     model_id,
     model_version,

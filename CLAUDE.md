@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-Career Copilot Lite is a stripped-down sibling of the full Career Copilot project (at `../CareerPilot`). It ships a focused MVP: a **detailed job tracker** plus a **profile match checker**. There is no LLM provider, no grounded rewrite, no eval harness — those live in the parent project.
+Career Copilot Lite is a stripped-down sibling of the full Career Copilot project (at `../CareerPilot`). It ships a focused MVP: a **detailed job tracker** plus a **profile match checker**. Grounded rewrite, cover-letter generation, and the eval harness live in the parent project. An optional LLM is permitted here for **on-demand JD body cleanup only** — reorganizing the captured `raw_text` into proper markdown sections, dropping CTAs / cookie banners / boilerplate, while preserving every substantive sentence verbatim. The LLM never paraphrases, summarizes, or invents content.
 
 Shipped:
 - **Capture** — MV3 scaffold, generic JSON-LD extractor with Readability + DOM-text fallback, `chrome.scripting.executeScript` on `<all_urls>`.
@@ -14,10 +14,12 @@ Shipped:
 - **Match checker** — every captured JD is scored against the user's profile facts on capture (and on edit). Score is the mean cosine of the top-10 facts retrieved against the JD vector. Surfaces as a colored chip on each list row and a full breakdown in detail view (score + top facts grouped by section). Re-ingesting the profile bumps a `profile_version`; stale rows show a strikethrough chip and a "Recompute" banner offers a one-click bulk refresh. Detail view also exposes per-JD "Recompute match".
 
 Out of scope (intentionally — these are reasons this project exists separately from the parent):
-- Any LLM call, prompt, or rewrite UI.
+- Rewrite UI, cover-letter / outreach drafting, or any LLM-generated user-facing prose.
 - Eval harness or rewrite validators.
-- BYOK / API key settings drawer.
 - Semantic JD search across the captured corpus.
+
+In scope but optional (off by default):
+- LLM-assisted **JD body cleanup**, on-demand only. The user clicks "Clean up JD ✨" on a captured row; the LLM returns a reorganized markdown version of the body (sections like Responsibilities / Requirements / Benefits, with CTAs and chrome stripped). The original `raw_text` is preserved alongside the cleaned text so both are viewable. Capture itself never calls the LLM. Gated behind a BYOK key in the settings drawer plus an enable toggle. The LLM is permitted to **filter and reorganize** captured text but must not paraphrase, summarize, or invent any sentence.
 
 ## Architecture
 
@@ -68,7 +70,8 @@ These are scalars + ids, not vectors — so they don't violate the "no vectors i
 
 ## Locked design decisions
 
-- **No LLM, no rewrite.** That entire workstream lives in the parent CareerPilot project. If you find yourself adding LLM calls, prompts, or BYOK settings here, stop and use the parent project instead — the whole point of this fork is to dogfood the tracker + match loop without the operational weight of a provider.
+- **No rewrite, no generated prose, no summaries.** Cover letters, application drafts, recruiter outreach, JD summaries / TL;DRs, eval validators — all live in the parent CareerPilot project. The LLM in this project is a **filter-and-reorganize tool only**: input is `raw_text`, output is the same content arranged into clean markdown sections, with chrome and CTAs dropped. Every substantive sentence in the input must appear in the output, verbatim. If a feature needs the model to author or rewrite content, it belongs in the parent.
+- **LLM is optional, BYOK, and on-demand.** Capture is deterministic-only — it never calls the LLM. Cleanup runs only when the user clicks "Clean up JD ✨" on a row, and only when (a) a key is saved and (b) the enable toggle is on. Missing key, network error, or provider failure surface as a status message; the row is unchanged. Provider host(s) for the LLM go in `connect-src`; that exception is for the cleanup endpoint only and does not open the door to rewrite/summary traffic.
 - **Match score is mean cosine of top-K profile facts.** No JD chunking, no asymmetric matching, no learned weights. The simplicity is the feature. Extensions go in new modules; don't add complexity to `src/match.js` itself.
 - **Generic extractor is the primary capture path.** `src/adapters/json-ld.js` + Readability + DOM-text fallback covers the long tail. Site-specific adapters are *refinements* (trim boilerplate, handle shadow DOM, pull richer metadata) — not the first line of coverage. Adding a per-site module requires justification: "the generic path produces unacceptable noise for this site because X."
 - **Embedding versioning is mandatory.** Every vector carries `{model_id, model_version}` (currently `Xenova/all-MiniLM-L6-v2` + `q-v1`). Swapping models requires a reindex; tagging makes that detectable instead of silent corruption.
@@ -135,10 +138,10 @@ If capture fails with "Cannot access contents of the page", the `<all_urls>` gra
 
 - **API permissions:** `sidePanel`, `offscreen`, `storage`, `scripting`.
 - **Host permissions:** `<all_urls>` — required for the generic extractor to reach any job page. Dev-mode tradeoff; will migrate to `optional_host_permissions` + per-origin `chrome.permissions.request()` before Chrome Web Store submission.
-- **CSP** `connect-src`: `huggingface.co` + `*.huggingface.co` + `*.hf.co` + `*.xethub.hf.co` + `cdn-lfs*.huggingface.co` (required for the Xet CDN redirects on first model download). No LLM provider hosts are listed — keep it that way.
+- **CSP** `connect-src`: `huggingface.co` + `*.huggingface.co` + `*.hf.co` + `*.xethub.hf.co` + `cdn-lfs*.huggingface.co` (required for the Xet CDN redirects on first model download), plus `api.groq.com` for the on-demand cleanup call. The LLM provider host exception is **for the cleanup endpoint only**. Do not list any host whose only purpose would be a rewrite, summary, eval, or chat-completion-as-prose call; that traffic does not belong here.
 
 ## Relation to the parent CareerPilot project
 
-This project is a sibling to `../CareerPilot`, not a fork. It was carved out so the tracker + match loop can be dogfooded independently of the rewrite workstream. If you need anything LLM-shaped (rewrite, citations, eval harness, prompt patches), open the parent project. If you need anything tracker- or match-shaped, work here.
+This project is a sibling to `../CareerPilot`, not a fork. It was carved out so the tracker + match loop can be dogfooded independently of the rewrite workstream. If you need anything that produces new content the user reads (rewrites, cover letters, summaries / TL;DRs, citations rendered into application copy, eval harness, prompt-tuning loops), open the parent project. If you need anything tracker-, capture-, or match-shaped, work here — including LLM-assisted **cleanup** of captured JDs (filter and reorganize, never paraphrase or summarize).
 
-When in doubt about which project a feature belongs to: does it require a model API call? If yes → parent. If no → here.
+When in doubt: does the feature ask the model to **filter and reorganize** content the user already captured, or to **author** new content (paraphrases, summaries, drafts)? Filter-and-reorganize → here (gated behind BYOK + on-demand). Author → parent.
