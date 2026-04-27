@@ -1,0 +1,703 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Career Copilot Lite</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        --line: rgba(127, 127, 127, 0.18);
+        --line-strong: rgba(127, 127, 127, 0.4);
+        --hover: rgba(127, 127, 127, 0.08);
+        --accent: #3b82f6;
+        --error: #c33;
+        --status-interested:   #64748b;
+        --status-applied:      #f59e0b;
+        --status-interviewing: #3b82f6;
+        --status-offer:        #10b981;
+        --status-rejected:     #f43f5e;
+        --status-archived:     #94a3b8;
+        --match-strong: #10b981;
+        --match-mid:    #f59e0b;
+        --match-weak:   #94a3b8;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-size: 13px;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+
+      /* ---------- Toolbar ---------- */
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--line);
+        height: 44px;
+        flex-shrink: 0;
+      }
+      .toolbar .back-btn {
+        background: none;
+        border: none;
+        font-size: 16px;
+        padding: 4px 6px;
+        cursor: pointer;
+        color: inherit;
+        border-radius: 4px;
+      }
+      .toolbar .back-btn:hover { background: var(--hover); }
+      .toolbar .title {
+        flex: 1;
+        font-weight: 600;
+        font-size: 13px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .toolbar .icon-btn {
+        background: none;
+        border: none;
+        font-size: 15px;
+        padding: 4px 8px;
+        cursor: pointer;
+        color: inherit;
+        border-radius: 4px;
+        opacity: 0.65;
+      }
+      .toolbar .icon-btn:hover { opacity: 1; background: var(--hover); }
+      .toolbar .icon-btn.has-dot::after {
+        content: '';
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--accent);
+        vertical-align: top;
+        margin-left: -2px;
+      }
+
+      /* ---------- Views ---------- */
+      .view {
+        flex: 1;
+        overflow-y: auto;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      [hidden] { display: none !important; }
+
+      /* ---------- Forms / shared ---------- */
+      textarea, input[type="text"] {
+        width: 100%;
+        border: 1px solid var(--line-strong);
+        border-radius: 6px;
+        padding: 8px;
+        font: inherit;
+        background: transparent;
+        color: inherit;
+        resize: vertical;
+      }
+      textarea { min-height: 80px; }
+      button {
+        padding: 6px 12px;
+        border-radius: 6px;
+        border: 1px solid currentColor;
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+        font: inherit;
+      }
+      button:hover { opacity: 0.8; }
+      button[disabled] { opacity: 0.4; cursor: wait; }
+      button.primary {
+        border-color: var(--accent);
+        color: var(--accent);
+        font-weight: 600;
+      }
+      button.primary:hover { background: rgba(59, 130, 246, 0.08); opacity: 1; }
+      button.danger:hover { color: var(--error); border-color: var(--error); }
+      button.dashed { border-style: dashed; opacity: 0.7; }
+      select {
+        border: 1px solid var(--line-strong);
+        border-radius: 6px;
+        padding: 4px 6px;
+        font: inherit;
+        background: transparent;
+        color: inherit;
+      }
+      label.field {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        font-size: 11px;
+        opacity: 0.7;
+      }
+      label.field input, label.field textarea, label.field select { opacity: 1; }
+      .status {
+        font-size: 11px;
+        opacity: 0.7;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+      }
+      .status.error { color: var(--error); opacity: 1; }
+      .empty { opacity: 0.5; font-style: italic; padding: 16px 4px; text-align: center; font-size: 12px; }
+      .row-actions {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        margin-top: 4px;
+      }
+      .status-picker { font-size: 11px; padding: 2px 4px; text-transform: capitalize; }
+      .edit-detail-btn,
+      .delete-btn {
+        font-size: 12px;
+        padding: 4px 10px;
+        line-height: 1.2;
+        border-radius: 6px;
+        border: 1px solid var(--line-strong);
+        background: transparent;
+        cursor: pointer;
+      }
+      .edit-detail-btn:hover { background: var(--hover); }
+      .delete-btn {
+        margin-left: auto;
+        color: var(--error);
+        border-color: rgba(204, 51, 51, 0.4);
+        opacity: 0.75;
+        padding: 4px 8px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .delete-btn svg { display: block; pointer-events: none; }
+      .delete-btn:hover {
+        opacity: 1;
+        background: rgba(204, 51, 51, 0.12);
+        border-color: var(--error);
+      }
+
+      /* ---------- Match chip (list row + detail) ---------- */
+      .match-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 11px;
+        padding: 2px 6px;
+        border-radius: 10px;
+        border: 1px solid currentColor;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        line-height: 1.4;
+      }
+      .match-chip[data-tier="strong"] { color: var(--match-strong); }
+      .match-chip[data-tier="mid"]    { color: var(--match-mid); }
+      .match-chip[data-tier="weak"]   { color: var(--match-weak); }
+      .match-chip[data-tier="none"]   { color: var(--line-strong); opacity: 0.7; }
+      .match-chip.stale {
+        opacity: 0.55;
+        text-decoration: line-through;
+        text-decoration-color: rgba(127, 127, 127, 0.6);
+      }
+
+      /* ---------- Library ---------- */
+      .library-capture {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .library-capture button.primary { width: 100%; padding: 10px; font-size: 13px; }
+      .library-capture details summary {
+        cursor: pointer;
+        font-size: 11px;
+        opacity: 0.7;
+        padding: 4px 0;
+      }
+      .library-filter {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .library-filter input { flex: 1; }
+      .recompute-banner {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 6px 10px;
+        border-radius: 6px;
+        background: rgba(245, 158, 11, 0.12);
+        border: 1px solid rgba(245, 158, 11, 0.4);
+        font-size: 11px;
+      }
+      .recompute-banner .label { flex: 1; }
+
+      /* ---------- Pipeline summary strip ---------- */
+      .pipeline-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        font-size: 11px;
+      }
+      .pipeline-chip {
+        cursor: pointer;
+        padding: 2px 8px;
+        border-radius: 10px;
+        border: 1px solid currentColor;
+        opacity: 0.75;
+        background: transparent;
+        font: inherit;
+        color: inherit;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+      }
+      .pipeline-chip:hover { opacity: 1; }
+      .pipeline-chip[data-status="interested"]   { color: var(--status-interested); }
+      .pipeline-chip[data-status="applied"]      { color: var(--status-applied); }
+      .pipeline-chip[data-status="interviewing"] { color: var(--status-interviewing); }
+      .pipeline-chip[data-status="offer"]        { color: var(--status-offer); }
+      .pipeline-chip[data-status="rejected"]     { color: var(--status-rejected); }
+      .pipeline-chip[data-status="archived"]     { color: var(--status-archived); }
+      .pipeline-chip.active { opacity: 1; font-weight: 600; }
+      .pipeline-chip .count { font-weight: 600; }
+
+      /* ---------- Follow-up chip ---------- */
+      .follow-up-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 11px;
+        padding: 2px 6px;
+        border-radius: 10px;
+        border: 1px solid currentColor;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        line-height: 1.4;
+        opacity: 0.85;
+      }
+      .follow-up-chip[data-tier="overdue"] { color: var(--error); }
+      .follow-up-chip[data-tier="today"]   { color: var(--status-applied); }
+      .follow-up-chip[data-tier="soon"]    { color: var(--status-interviewing); }
+      .follow-up-chip[data-tier="future"]  { color: var(--match-weak); }
+
+      /* ---------- Status timeline (detail) ---------- */
+      .status-timeline {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 8px;
+        font-size: 11px;
+        opacity: 0.8;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+      }
+      .status-timeline .stage { display: inline-flex; align-items: center; gap: 4px; }
+      .status-timeline .arrow { opacity: 0.45; }
+      .status-timeline .stage[data-status="interested"]   { color: var(--status-interested); }
+      .status-timeline .stage[data-status="applied"]      { color: var(--status-applied); }
+      .status-timeline .stage[data-status="interviewing"] { color: var(--status-interviewing); }
+      .status-timeline .stage[data-status="offer"]        { color: var(--status-offer); }
+      .status-timeline .stage[data-status="rejected"]     { color: var(--status-rejected); }
+      .status-timeline .stage[data-status="archived"]     { color: var(--status-archived); }
+      .status-timeline .when { opacity: 0.6; font-size: 10px; }
+
+      /* ---------- Structured-field chips (detail) ---------- */
+      .field-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 6px;
+        font-size: 11px;
+      }
+      .field-chip {
+        padding: 2px 6px;
+        border-radius: 4px;
+        background: var(--hover);
+        opacity: 0.85;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+      }
+
+      /* ---------- Notes (detail) ---------- */
+      .notes-block {
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 12px;
+        line-height: 1.45;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--hover);
+      }
+
+      /* ---------- JD list ---------- */
+      .jobs-list {
+        display: flex;
+        flex-direction: column;
+      }
+      .row {
+        border-top: 1px solid var(--line);
+        border-left: 3px solid var(--line-strong);
+        padding: 10px 8px 10px 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        cursor: pointer;
+        transition: background 0.1s ease;
+      }
+      .row:last-child { border-bottom: 1px solid var(--line); }
+      .row:hover { background: var(--hover); }
+      .row .title { font-weight: 600; }
+      .row[data-status="interested"]   { border-left-color: var(--status-interested); }
+      .row[data-status="applied"]      { border-left-color: var(--status-applied); }
+      .row[data-status="interviewing"] { border-left-color: var(--status-interviewing); }
+      .row[data-status="offer"]        { border-left-color: var(--status-offer); }
+      .row[data-status="rejected"]     { border-left-color: var(--status-rejected); }
+      .row[data-status="archived"]     { border-left-color: var(--status-archived); opacity: 0.55; }
+      .row .meta { font-size: 11px; opacity: 0.6; }
+      .row .preview {
+        font-size: 11px;
+        opacity: 0.85;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 36px;
+        overflow: hidden;
+      }
+
+      /* ---------- Detail ---------- */
+      .detail-header {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .detail-meta { font-size: 11px; opacity: 0.65; }
+      .detail-actions {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .detail-body {
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 12px;
+        line-height: 1.45;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        max-height: 320px;
+        overflow-y: auto;
+      }
+      .detail-section-label {
+        font-size: 11px;
+        font-weight: 600;
+        opacity: 0.6;
+        margin-top: 4px;
+      }
+
+      /* ---------- Match section (detail) ---------- */
+      .match-card {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .match-headline {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .match-headline .big-score {
+        font-size: 22px;
+        font-weight: 700;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+      }
+      .match-headline .big-score[data-tier="strong"] { color: var(--match-strong); }
+      .match-headline .big-score[data-tier="mid"]    { color: var(--match-mid); }
+      .match-headline .big-score[data-tier="weak"]   { color: var(--match-weak); }
+      .match-headline .label {
+        font-size: 11px;
+        opacity: 0.7;
+      }
+      .match-headline .stale-tag {
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        padding: 2px 6px;
+        border-radius: 4px;
+        background: rgba(245, 158, 11, 0.18);
+        color: var(--match-mid);
+      }
+      .match-facts {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .match-facts .section-block {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .match-facts .section-name {
+        font-weight: 600;
+        font-size: 11px;
+        opacity: 0.7;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 2px;
+      }
+      .match-facts .fact {
+        font-size: 11px;
+        line-height: 1.4;
+        padding: 4px 8px;
+        border-left: 2px solid var(--line);
+        margin-left: 4px;
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+      }
+      .match-facts .fact .score {
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        font-size: 10px;
+        opacity: 0.6;
+        flex-shrink: 0;
+        min-width: 36px;
+      }
+      .match-actions {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+
+      /* ---------- Edit form ---------- */
+      .edit-form {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .edit-form label {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        font-size: 11px;
+        opacity: 0.7;
+      }
+      .edit-form input, .edit-form textarea { font-size: 12px; opacity: 1; }
+      .edit-form textarea {
+        min-height: 200px;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        font-size: 11px;
+        line-height: 1.4;
+      }
+      .edit-form .form-actions { display: flex; gap: 6px; }
+      .edit-form .save-btn { font-weight: 600; }
+
+      /* ---------- Drawers ---------- */
+      .drawer-backdrop {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.35);
+        z-index: 10;
+      }
+      .drawer {
+        position: fixed;
+        top: 44px;
+        left: 0;
+        right: 0;
+        max-height: calc(100vh - 44px);
+        overflow-y: auto;
+        padding: 16px;
+        background: Canvas;
+        border-bottom: 1px solid var(--line);
+        z-index: 11;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        box-shadow: 0 6px 16px rgba(0, 0, 0, 0.18);
+      }
+      .drawer-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .drawer-header h2 {
+        font-size: 13px;
+        font-weight: 600;
+        margin: 0;
+      }
+      .drawer-summary { font-size: 11px; opacity: 0.7; }
+      .progress {
+        height: 3px;
+        width: 100%;
+        background: var(--line);
+        border-radius: 2px;
+        overflow: hidden;
+      }
+      .progress-fill {
+        height: 100%;
+        width: 0;
+        background: var(--accent);
+        transition: width 0.15s ease-out;
+      }
+      .profile-facts-summary {
+        cursor: pointer;
+        font-size: 11px;
+        opacity: 0.75;
+        padding: 6px 0;
+        margin-top: 4px;
+        border-top: 1px solid var(--line);
+      }
+      .profile-facts-summary:hover { opacity: 1; }
+      .profile-metrics {
+        margin: 8px 0;
+        padding: 8px 10px;
+        border-radius: 6px;
+        background: var(--hover);
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        font-size: 11px;
+      }
+      .profile-metrics .total { font-weight: 600; }
+      .profile-metrics .breakdown {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 10px;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        font-size: 10px;
+        opacity: 0.85;
+      }
+      .profile-metrics .breakdown .sparse { color: var(--status-applied); }
+      .profile-metrics .model {
+        font-size: 10px;
+        opacity: 0.55;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+      }
+      .profile-facts-list {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        margin-top: 8px;
+      }
+      .profile-facts-list .section-block { display: flex; flex-direction: column; gap: 4px; }
+      .profile-facts-list .section-name {
+        font-weight: 600;
+        font-size: 12px;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 2px;
+      }
+      .profile-facts-list .subsection-block {
+        margin-left: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        margin-top: 4px;
+      }
+      .profile-facts-list .subsection-name {
+        font-size: 11px;
+        opacity: 0.7;
+        font-style: italic;
+      }
+      .profile-facts-list .fact {
+        font-size: 11px;
+        padding: 2px 0 2px 12px;
+        line-height: 1.4;
+        border-left: 2px solid var(--line);
+        margin-left: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- ==================== Toolbar ==================== -->
+    <div class="toolbar">
+      <button id="back-btn" class="back-btn" hidden title="back to library">←</button>
+      <div id="toolbar-title" class="title">Career Copilot Lite</div>
+      <button id="open-profile" class="icon-btn" title="profile">👤</button>
+    </div>
+
+    <!-- ==================== Library view ==================== -->
+    <div id="library-view" class="view">
+      <div class="library-capture">
+        <button id="capture-tab" class="primary">Capture current tab</button>
+        <span id="capture-tab-status" class="status"></span>
+        <details>
+          <summary>or paste JD text</summary>
+          <textarea id="paste" placeholder="Paste a job description here…" style="margin-top:6px;"></textarea>
+          <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
+            <button id="capture">Capture paste</button>
+            <span id="capture-status" class="status"></span>
+          </div>
+        </details>
+      </div>
+
+      <div id="recompute-banner" class="recompute-banner" hidden>
+        <span id="recompute-banner-label" class="label">Profile updated — match scores are stale.</span>
+        <button id="recompute-all-btn">Recompute</button>
+      </div>
+
+      <div class="library-filter">
+        <input id="filter" type="text" placeholder="filter by title, company, notes, or content…" />
+        <select id="status-filter" title="filter by status">
+          <option value="active">Active</option>
+          <option value="all">All</option>
+          <option value="needs_follow_up">Needs follow-up</option>
+          <option value="interested">Interested</option>
+          <option value="applied">Applied</option>
+          <option value="interviewing">Interviewing</option>
+          <option value="offer">Offer</option>
+          <option value="rejected">Rejected</option>
+          <option value="archived">Archived</option>
+        </select>
+        <select id="sort-mode" title="sort">
+          <!-- options populated from constants.js -->
+        </select>
+      </div>
+
+      <div id="pipeline-strip" class="pipeline-strip" hidden></div>
+
+      <div id="jobs" class="jobs-list empty">(none yet)</div>
+    </div>
+
+    <!-- ==================== Detail view ==================== -->
+    <div id="detail-view" class="view" hidden>
+      <div id="detail-content"><!-- populated by renderDetail() --></div>
+    </div>
+
+    <!-- ==================== Profile drawer ==================== -->
+    <div id="profile-backdrop" class="drawer-backdrop" hidden></div>
+    <div id="profile-drawer" class="drawer" hidden>
+      <div class="drawer-header">
+        <h2>Profile</h2>
+        <button id="close-profile" class="icon-btn" title="close">✕</button>
+      </div>
+      <div id="profile-summary" class="drawer-summary">(no profile yet)</div>
+      <input id="profile-file" type="file" accept=".md,text/markdown,text/plain" style="font-size:11px;" />
+      <textarea id="profile-paste" placeholder="…or paste profile.md contents here" style="min-height:160px; font-family: ui-monospace, SF Mono, Menlo, monospace; font-size: 11px;"></textarea>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button id="ingest-profile" class="primary">Ingest profile</button>
+        <button id="clear-profile" class="dashed">Clear</button>
+        <span id="profile-status" class="status"></span>
+      </div>
+      <div id="ingest-progress" class="progress" hidden>
+        <div id="ingest-progress-fill" class="progress-fill"></div>
+      </div>
+
+      <details id="profile-facts-details" hidden>
+        <summary class="profile-facts-summary">View facts</summary>
+        <div id="profile-metrics" class="profile-metrics"></div>
+        <div id="profile-facts-list" class="profile-facts-list"></div>
+      </details>
+
+      <div class="profile-facts-summary" style="cursor: default;">Export jobs</div>
+      <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 11px;">
+        <button id="export-csv">CSV</button>
+        <button id="export-json">JSON</button>
+        <label style="display: inline-flex; align-items: center; gap: 4px; opacity: 0.75;">
+          <input id="export-redact" type="checkbox" />
+          redact JD body
+        </label>
+        <span id="export-status" class="status"></span>
+      </div>
+    </div>
+
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

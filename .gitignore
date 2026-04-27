@@ -1,0 +1,12 @@
+.DS_Store
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.local
+.vscode/
+.idea/
+
+# Personal profile data — never commit. Use profile.example.md for shareable samples.
+profile.md
