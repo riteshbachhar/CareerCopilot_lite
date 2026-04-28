@@ -85,11 +85,51 @@ export async function extractJobPostingFromPage() {
   }
 
   if (!candidates.length) {
-    // Readability fallback — runs before the naive DOM strip when
-    // available. Mozilla's reader-view algorithm handles modern career
-    // SPAs (heavy chrome, multi-column layouts, hidden boilerplate) far
-    // better than CSS-selector heuristics. Loaded into globalThis by
-    // readability.js, which background.js injects before this extractor.
+    // Compute DOM-text first. We need it both as the final fallback and
+    // as a yardstick to detect Readability cropping (see below). Capture
+    // preserves; the optional LLM cleanup step is the layer that filters
+    // chrome — so no boilerplate-heading trim here. Anchored
+    // CTA/cookie-line filter only.
+    const mainEl =
+      document.querySelector(
+        'main, article, [role="main"], #main, #content, .job__description',
+      ) ?? document.body;
+    const domClone = mainEl.cloneNode(true);
+    domClone
+      .querySelectorAll(
+        'script, style, nav, header, footer, aside, form, [role="navigation"], [role="banner"], [role="contentinfo"]',
+      )
+      .forEach((el) => el.remove());
+
+    let domText = (domClone.textContent ?? '')
+      .replace(/\s+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/[ \t]+/g, ' ')
+      .trim();
+
+    const CTA_PATTERNS = [
+      /^apply\s+(now|for\s+this\s+(job|position|role))\b/i,
+      /^submit\s+your\s+application\b/i,
+      /^we\s+use\s+cookies\b/i,
+      /^accept\s+(all\s+)?cookies\b/i,
+    ];
+    domText = domText
+      .split('\n')
+      .filter((line) => {
+        const t = line.trim();
+        if (!t) return true;
+        return !CTA_PATTERNS.some((re) => re.test(t));
+      })
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
+    // Try Readability. It scores DOM subtrees and returns the highest one,
+    // with cleaner article metadata (title, siteName) than DOM-text. But
+    // it picks a *single* subtree, so on SPAs that split content across
+    // sibling components (e.g. Interfolio's Angular layout) it can
+    // silently crop half the JD. Accept its output only when it's
+    // competitive with DOM-text length — a big gap signals cropping.
     if (typeof globalThis.Readability === 'function') {
       try {
         // Readability mutates the document it parses, so clone first.
@@ -100,7 +140,10 @@ export async function extractJobPostingFromPage() {
           .replace(/\n{3,}/g, '\n\n')
           .replace(/[ \t]+/g, ' ')
           .trim();
-        if (readableText.length >= 200) {
+        if (
+          readableText.length >= 200 &&
+          readableText.length >= domText.length * 0.8
+        ) {
           return {
             ok: true,
             jd: {
@@ -119,86 +162,14 @@ export async function extractJobPostingFromPage() {
           };
         }
       } catch {
-        // Fall through to the naive DOM strip below.
+        // Fall through to DOM-text.
       }
     }
 
-    // Final fallback: hand-rolled DOM text extraction. Used when
-    // Readability is unavailable (injection skipped) or its output is
-    // too short to be a real JD.
-    const mainEl =
-      document.querySelector(
-        'main, article, [role="main"], #main, #content, .job__description',
-      ) ?? document.body;
-    const clone = mainEl.cloneNode(true);
-    clone
-      .querySelectorAll(
-        'script, style, nav, header, footer, aside, form, [role="navigation"], [role="banner"], [role="contentinfo"]',
-      )
-      .forEach((el) => el.remove());
-
-    // Boilerplate trim: drop heading + following siblings (until the next
-    // same-or-higher heading) when the heading text matches a known
-    // boilerplate section. Anchored patterns only — false positives here
-    // silently delete real JD content.
-    const BOILERPLATE_HEADINGS = [
-      /equal\s+opportunity|^EEO\b|diversity\s+(and|&)\s+inclusion|affirmative\s+action/i,
-      /^benefits$|what\s+we\s+offer|^perks(\s+and\s+benefits)?$|^compensation(\s+range)?$|pay\s+(range|transparency)/i,
-      /^about\s+(us|the\s+company|the\s+team)$|^who\s+we\s+are$|^our\s+(mission|story|values|culture)$/i,
-      /^how\s+to\s+apply$|application\s+(instructions|process)|^next\s+steps$/i,
-    ];
-    const isBoilerplateHeading = (el) => {
-      const txt = (el.textContent ?? '').trim();
-      if (txt.length < 3 || txt.length > 80) return false;
-      return BOILERPLATE_HEADINGS.some((re) => re.test(txt));
-    };
-    const headings = Array.from(clone.querySelectorAll('h1, h2, h3, h4'));
-    for (const h of headings) {
-      if (!h.isConnected) continue;
-      if (!isBoilerplateHeading(h)) continue;
-      const level = parseInt(h.tagName[1], 10);
-      let node = h;
-      const toRemove = [];
-      while (node) {
-        toRemove.push(node);
-        const next = node.nextElementSibling;
-        if (next && /^H[1-4]$/.test(next.tagName)) {
-          const nextLevel = parseInt(next.tagName[1], 10);
-          if (nextLevel <= level) break;
-        }
-        node = node.nextElementSibling;
-      }
-      toRemove.forEach((n) => n.remove());
-    }
-
-    let description = (clone.textContent ?? '')
-      .replace(/\s+\n/g, '\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .replace(/[ \t]+/g, ' ')
-      .trim();
-
-    // Strip standalone CTA / cookie lines that survive the heading pass.
-    const CTA_PATTERNS = [
-      /^apply\s+(now|for\s+this\s+(job|position|role))\b/i,
-      /^submit\s+your\s+application\b/i,
-      /^we\s+use\s+cookies\b/i,
-      /^accept\s+(all\s+)?cookies\b/i,
-    ];
-    description = description
-      .split('\n')
-      .filter((line) => {
-        const t = line.trim();
-        if (!t) return true;
-        return !CTA_PATTERNS.some((re) => re.test(t));
-      })
-      .join('\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-
-    if (description.length < 200) {
+    if (domText.length < 200) {
       return {
         ok: false,
-        error: `no JobPosting schema + DOM text too short (${description.length} chars) — try pasting the JD`,
+        error: `no JobPosting schema + DOM text too short (${domText.length} chars) — try pasting the JD`,
       };
     }
 
@@ -214,7 +185,7 @@ export async function extractJobPostingFromPage() {
         title,
         company: null,
         location: null,
-        description,
+        description: domText,
         source: 'dom-text',
         structured_fields: null,
       },
