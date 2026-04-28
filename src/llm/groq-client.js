@@ -113,6 +113,96 @@ export async function cleanupJd({ rawText, settings }) {
   }
 }
 
+// Resume / CV extraction. Reads raw resume text and returns structured facts
+// in the same shape parseProfileMarkdown produces, so the existing per-fact
+// embed-and-store loop in background.js can ingest them unchanged.
+//
+// Returns the same failure-mode contract as cleanupJd:
+//   { facts: [...], latencyMs }      on success
+//   { facts: null, skipped: ... }    when LLM is gated off
+//   { facts: null, error: ... }      on provider/network/parse errors
+
+const RESUME_SYSTEM_PROMPT = `You are a resume / CV parser. Given the raw text of a resume, extract atomic facts and return a JSON object.
+
+PRESERVE VERBATIM. Every fact's "text" field MUST be copied verbatim from the resume — same words, same wording. DO NOT paraphrase, summarize, or rephrase. You may fix only obvious whitespace / line-break artifacts from PDF extraction.
+
+GROUPING:
+- "section" is the top-level category. Use these exact labels when applicable: Experience, Education, Skills, Projects, Publications, Certifications, Awards, Open Source. Other labels are fine when the resume has uncommon sections (e.g. "Leadership", "Languages", "Volunteering").
+- "subsection" is the specific role / school / project / publication, with date range when present. Examples: "Stripe — Senior Engineer (2020–2024)", "MIT — BS Computer Science (2014–2018)". Use null for facts that don't belong to a specific subsection (e.g. a flat Skills list).
+
+ATOMIC FACTS:
+- Each fact is one bullet or one sentence — the smallest meaningful claim.
+- Multi-bullet items in the resume become multiple facts.
+- A line like "Skills: Python, Go, TypeScript" should be ONE fact preserving the exact wording — do not split mid-phrase.
+
+DROP these (boilerplate, not user claims):
+- Page numbers, headers/footers, "References available on request"
+- The applicant's name + contact details (phone, email, address, LinkedIn URL)
+- Section title lines themselves (they become "section" / "subsection", not facts)
+
+OUTPUT — return ONLY this JSON, no commentary, no preamble, no code fences:
+{
+  "facts": [
+    { "section": "...", "subsection": "..." | null, "text": "..." }
+  ]
+}`;
+
+const RESUME_MAX_INPUT_CHARS = 16_000;
+
+export async function extractResumeFacts({ rawText, settings }) {
+  if (!settings?.apiKey) return { facts: null, skipped: 'no-key' };
+  if (!settings?.enabled) return { facts: null, skipped: 'disabled' };
+  if (typeof rawText !== 'string' || rawText.trim().length < 200) {
+    return { facts: null, skipped: 'too-short' };
+  }
+
+  const input =
+    rawText.length > RESUME_MAX_INPUT_CHARS
+      ? rawText.slice(0, RESUME_MAX_INPUT_CHARS) + '\n[…truncated]'
+      : rawText;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  const t0 = performance.now();
+  try {
+    const res = await postChatCompletion({
+      apiKey: settings.apiKey,
+      model: settings.model || 'llama-3.1-8b-instant',
+      signal: controller.signal,
+      maxTokens: 4000,
+      jsonMode: true,
+      messages: [
+        { role: 'system', content: RESUME_SYSTEM_PROMPT },
+        { role: 'user', content: input },
+      ],
+    });
+    if (!res.ok) {
+      const detail = await readErrorDetail(res);
+      return { facts: null, error: `${res.status} ${res.statusText}${detail}` };
+    }
+    const json = await res.json();
+    const content = json?.choices?.[0]?.message?.content;
+    if (typeof content !== 'string' || !content.trim()) {
+      return { facts: null, error: 'malformed-response' };
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      return { facts: null, error: 'malformed-json' };
+    }
+    return {
+      facts: parsed,
+      latencyMs: Math.round(performance.now() - t0),
+    };
+  } catch (err) {
+    if (err?.name === 'AbortError') return { facts: null, error: 'timeout' };
+    return { facts: null, error: String(err?.message ?? err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Tiny request used by the settings drawer's "Test connection" button.
 export async function testGroqConnection(settings) {
   if (!settings?.apiKey) return { ok: false, error: 'no-key' };

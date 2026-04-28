@@ -62,6 +62,17 @@ async function copyStatic() {
   } else {
     console.log('[build] onnxruntime-web not installed yet — skipping WASM copy');
   }
+
+  // pdf.js worker — required for resume PDF parsing in the offscreen doc.
+  // Bundled separately because pdf.js spawns a Worker(workerSrc), which can't
+  // resolve its source through esbuild's bundler.
+  const pdfWorker = 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs';
+  if (existsSync(pdfWorker)) {
+    await cp(pdfWorker, path.join(outdir, 'pdf.worker.mjs'));
+    console.log('[build] copied pdf.js worker');
+  } else {
+    console.log('[build] pdfjs-dist not installed yet — skipping pdf worker copy');
+  }
 }
 
 await copyStatic();

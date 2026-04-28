@@ -51,6 +51,8 @@ const ingestProgressFill = $('ingest-progress-fill');
 const profileFactsDetails = $('profile-facts-details');
 const profileMetrics = $('profile-metrics');
 const profileFactsList = $('profile-facts-list');
+const resumeFile = $('resume-file');
+const resumeUploadBtn = $('resume-upload-btn');
 const exportCsvBtn = $('export-csv');
 const exportJsonBtn = $('export-json');
 const exportRedact = $('export-redact');
@@ -1312,6 +1314,67 @@ profileFile.addEventListener('change', async () => {
   profilePaste.value = text;
 });
 
+// ---------- Resume upload (PDF / plain text) ----------
+
+resumeUploadBtn.addEventListener('click', () => resumeFile.click());
+
+// Convert an ArrayBuffer to base64. Chunked to avoid call-stack limits on
+// large files (String.fromCharCode.apply has a per-call argument cap).
+function arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+resumeFile.addEventListener('change', async () => {
+  const file = resumeFile.files?.[0];
+  if (!file) return;
+  const name = file.name.toLowerCase();
+  resumeUploadBtn.disabled = true;
+  clearProfileBtn.disabled = true;
+  profileStatus.className = 'status';
+  setProgress(0, 1);
+
+  const t0 = performance.now();
+  try {
+    let resp;
+    if (name.endsWith('.pdf')) {
+      profileStatus.textContent = 'reading PDF…';
+      const buffer = await file.arrayBuffer();
+      const base64 = arrayBufferToBase64(buffer);
+      resp = await send('ingest-resume', {
+        kind: 'pdf',
+        base64,
+        filename: file.name,
+      });
+    } else if (name.endsWith('.txt') || file.type === 'text/plain') {
+      profileStatus.textContent = 'reading text…';
+      const text = await file.text();
+      resp = await send('ingest-resume', { kind: 'text', text });
+    } else {
+      throw new Error(`Unsupported file type: ${file.name}. Use .pdf or .txt (or paste markdown under Advanced).`);
+    }
+    if (!resp?.ok) throw new Error(resp?.error ?? 'ingest failed');
+    const totalMs = performance.now() - t0;
+    profileStatus.textContent = `ingested ${resp.count} fact(s) · ${fmt(totalMs)}ms total${resp.dropped ? ` · ${resp.dropped} malformed dropped` : ''}`;
+    await refreshProfileSummary();
+    await refreshProfileFactsView();
+    await refreshJobs();
+  } catch (err) {
+    profileStatus.className = 'status error';
+    profileStatus.textContent = `error: ${String(err?.message ?? err)}`;
+  } finally {
+    resumeUploadBtn.disabled = false;
+    clearProfileBtn.disabled = false;
+    resumeFile.value = '';
+    setTimeout(() => setProgress(0, 0), 1200);
+  }
+});
+
 ingestProfileBtn.addEventListener('click', async () => {
   const md = profilePaste.value.trim();
   if (!md) {
@@ -1474,7 +1537,10 @@ function populateSortDropdown() {
 // Background pings for long-running ingest + match-stale notifications.
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.target !== 'sidepanel') return false;
-  if (msg.type === 'ingest-progress') {
+  if (msg.type === 'ingest-stage') {
+    profileStatus.className = 'status';
+    profileStatus.textContent = msg.stage;
+  } else if (msg.type === 'ingest-progress') {
     profileStatus.className = 'status';
     profileStatus.textContent = `embedding ${msg.done} / ${msg.total}…`;
     setProgress(msg.done, msg.total);

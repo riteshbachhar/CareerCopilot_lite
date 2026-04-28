@@ -792,16 +792,31 @@
         <button id="close-profile" class="icon-btn" title="close">✕</button>
       </div>
       <div id="profile-summary" class="drawer-summary">(no profile yet)</div>
-      <input id="profile-file" type="file" accept=".md,text/markdown,text/plain" style="font-size:11px;" />
-      <textarea id="profile-paste" placeholder="…or paste profile.md contents here" style="min-height:160px; font-family: ui-monospace, SF Mono, Menlo, monospace; font-size: 11px;"></textarea>
+
+      <div class="drawer-summary" style="font-size: 11px; opacity: 0.75;">
+        Upload your resume (PDF or plain-text). The LLM extracts atomic facts (Experience bullets, Skills, Education) into the same structured form the match scoring needs. Requires an LLM key — configure in Settings ⚙.
+      </div>
+
+      <input id="resume-file" type="file" accept=".pdf,.txt,application/pdf,text/plain" style="display:none;" />
+      <button id="resume-upload-btn" class="primary">Upload resume</button>
       <div style="display:flex; gap:8px; align-items:center;">
-        <button id="ingest-profile" class="primary">Ingest profile</button>
-        <button id="clear-profile" class="dashed">Clear</button>
+        <button id="clear-profile" class="dashed">Clear profile</button>
         <span id="profile-status" class="status"></span>
       </div>
       <div id="ingest-progress" class="progress" hidden>
         <div id="ingest-progress-fill" class="progress-fill"></div>
       </div>
+
+      <details id="advanced-profile-details">
+        <summary class="profile-facts-summary">Advanced: paste markdown directly</summary>
+        <div style="margin-top: 8px; display: flex; flex-direction: column; gap: 8px;">
+          <input id="profile-file" type="file" accept=".md,text/markdown,text/plain" style="font-size:11px;" />
+          <textarea id="profile-paste" placeholder="…or paste profile.md contents here" style="min-height:160px; font-family: ui-monospace, SF Mono, Menlo, monospace; font-size: 11px;"></textarea>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <button id="ingest-profile">Ingest markdown</button>
+          </div>
+        </div>
+      </details>
 
       <details id="profile-facts-details" hidden>
         <summary class="profile-facts-summary">View facts</summary>

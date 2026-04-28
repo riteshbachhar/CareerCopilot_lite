@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^4.1.0",
-    "@mozilla/readability": "^0.6.0"
+    "@mozilla/readability": "^0.6.0",
+    "pdfjs-dist": "^5.7.284"
   }
 }

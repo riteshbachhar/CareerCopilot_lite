@@ -20,6 +20,7 @@ Out of scope (intentionally — these are reasons this project exists separately
 
 In scope but optional (off by default):
 - LLM-assisted **JD body cleanup**, on-demand only. The user clicks "Clean up JD ✨" on a captured row; the LLM returns a reorganized markdown version of the body (sections like Responsibilities / Requirements / Benefits, with CTAs and chrome stripped). The original `raw_text` is preserved alongside the cleaned text so both are viewable. Capture itself never calls the LLM. Gated behind a BYOK key in the settings drawer plus an enable toggle. The LLM is permitted to **filter and reorganize** captured text but must not paraphrase, summarize, or invent any sentence.
+- LLM-assisted **resume parsing**, at profile-upload time only. The user uploads a CV (PDF or plain text); pdf.js extracts the text in the offscreen doc, and the LLM splits it into atomic `{section, subsection, text}` facts in the same shape the markdown parser produces. The `text` field is verbatim from the resume — no paraphrasing or summarization. Output then flows through the existing per-fact embed-and-store loop unchanged. The hand-curated markdown paste path remains as a collapsed "Advanced" option for power users.
 
 ## Architecture
 

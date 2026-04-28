@@ -21,7 +21,12 @@ import {
 import { extractJobPostingFromPage } from './adapters/json-ld.js';
 import { parseProfileMarkdown } from './profile/parse-markdown.js';
 import { computeMatch } from './match.js';
-import { cleanupJd, testGroqConnection } from './llm/groq-client.js';
+import {
+  cleanupJd,
+  extractResumeFacts,
+  testGroqConnection,
+} from './llm/groq-client.js';
+import { validateResumeFacts } from './profile/parse-resume.js';
 import {
   getLlmSettings,
   setLlmSettings,
@@ -84,6 +89,49 @@ function inferSeniority(title) {
   if (/\b(junior|jr\.?|entry[- ]level|associate)\b/.test(t)) return 'junior';
   if (/\b(intern|internship)\b/.test(t)) return 'intern';
   return null;
+}
+
+// Notify the side panel of a non-numeric ingest stage ("parsing PDF…",
+// "parsing with LLM…"). The numeric per-fact embed progress uses the
+// existing ingest-progress message type with done/total fields.
+function notifyIngestStage(stage) {
+  chrome.runtime
+    .sendMessage({ target: 'sidepanel', type: 'ingest-stage', stage })
+    .catch(() => {});
+}
+
+// Shared per-fact ingest loop. Used by both ingest-profile (markdown facts)
+// and ingest-resume (LLM-extracted facts). Wipes the profile, embeds every
+// fact, stores it, pings progress per fact, then bumps profile_version and
+// fires match-stale so the side panel can mark existing matches as stale.
+async function ingestFactList(facts) {
+  await clearProfile();
+  const total = facts.length;
+  let done = 0;
+  for (const fact of facts) {
+    const breadcrumb = [fact.section, fact.subsection].filter(Boolean).join(' › ');
+    const embedInput = [breadcrumb, fact.text].filter(Boolean).join('\n');
+    const { vector, dims, modelId, modelVersion } = await embedViaOffscreen(embedInput);
+    const row = await addProfileFact({
+      section: fact.section,
+      subsection: fact.subsection,
+      text: fact.text,
+      order: fact.order,
+      model_id: modelId,
+      model_version: modelVersion,
+    });
+    await putProfileEmbedding({ fact_id: row.id, vector, dims });
+    done += 1;
+    chrome.runtime
+      .sendMessage({ target: 'sidepanel', type: 'ingest-progress', done, total })
+      .catch(() => {});
+  }
+  const newVersion = String(Date.now());
+  await setProfileVersion(newVersion);
+  chrome.runtime
+    .sendMessage({ target: 'sidepanel', type: 'match-stale', profile_version: newVersion })
+    .catch(() => {});
+  return { count: done, profile_version: newVersion };
 }
 
 // Compute and persist a match score for a JD. Reads the existing JD vector
@@ -390,53 +438,79 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const markdown = String(msg.markdown ?? '');
         const facts = parseProfileMarkdown(markdown);
         if (facts.length === 0) throw new Error('no facts parsed from markdown');
+        const result = await ingestFactList(facts);
+        sendResponse({ ok: true, ...result });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
 
-        await clearProfile();
-
-        const total = facts.length;
-        let done = 0;
-        for (const fact of facts) {
-          const breadcrumb = [fact.section, fact.subsection]
-            .filter(Boolean)
-            .join(' › ');
-          const embedInput = [breadcrumb, fact.text]
-            .filter(Boolean)
-            .join('\n');
-          const { vector, dims, modelId, modelVersion } =
-            await embedViaOffscreen(embedInput);
-          const row = await addProfileFact({
-            section: fact.section,
-            subsection: fact.subsection,
-            text: fact.text,
-            order: fact.order,
-            model_id: modelId,
-            model_version: modelVersion,
-          });
-          await putProfileEmbedding({ fact_id: row.id, vector, dims });
-          done += 1;
-          chrome.runtime
-            .sendMessage({
-              target: 'sidepanel',
-              type: 'ingest-progress',
-              done,
-              total,
-            })
-            .catch(() => {});
+  if (msg.type === 'ingest-resume') {
+    (async () => {
+      try {
+        const settings = await getLlmSettings();
+        if (!settings.apiKey || !settings.enabled) {
+          throw new Error('Resume upload requires the LLM. Add a key in Settings ⚙ and enable it, or use the Advanced markdown paste path.');
         }
 
-        // Bump profile_version so existing match scores can be detected as
-        // stale by the side panel without recomputing them eagerly here.
-        const newVersion = String(Date.now());
-        await setProfileVersion(newVersion);
-        chrome.runtime
-          .sendMessage({
-            target: 'sidepanel',
-            type: 'match-stale',
-            profile_version: newVersion,
-          })
-          .catch(() => {});
+        // Stage 1: get plain text (from the request, or by parsing a PDF in offscreen).
+        let rawText;
+        if (msg.kind === 'pdf') {
+          if (typeof msg.base64 !== 'string' || !msg.base64.length) {
+            throw new Error('PDF payload missing');
+          }
+          notifyIngestStage('parsing PDF…');
+          await ensureOffscreen();
+          const parseResp = await chrome.runtime.sendMessage({
+            target: 'offscreen',
+            type: 'parse-pdf',
+            base64: msg.base64,
+          });
+          if (!parseResp?.ok) {
+            throw new Error(`PDF parse failed: ${parseResp?.error ?? 'unknown'}`);
+          }
+          rawText = parseResp.text ?? '';
+          if (rawText.trim().length < 200) {
+            throw new Error("Couldn't read text from this PDF — it may be a scanned image. Try a text-based PDF or paste markdown under Advanced.");
+          }
+        } else if (msg.kind === 'text') {
+          rawText = String(msg.text ?? '');
+          if (rawText.trim().length < 200) throw new Error('Resume text too short.');
+        } else {
+          throw new Error(`unknown ingest-resume kind: ${msg.kind}`);
+        }
 
-        sendResponse({ ok: true, count: done, profile_version: newVersion });
+        // Stage 2: LLM extraction.
+        notifyIngestStage('parsing with LLM…');
+        const out = await extractResumeFacts({ rawText, settings });
+        if (!out.facts) {
+          if (out.skipped) throw new Error(`LLM skipped: ${out.skipped}`);
+          throw new Error(`LLM error: ${out.error ?? 'unknown'}`);
+        }
+
+        // Stage 3: validate. Drop nothing-shaped, never throw.
+        const { valid, dropped } = validateResumeFacts(out.facts);
+        if (valid.length === 0) {
+          throw new Error(
+            "Couldn't extract facts from this resume — try saving as text and pasting under Advanced.",
+          );
+        }
+        if (dropped.length) {
+          console.warn('[ingest-resume] dropped', dropped.length, 'malformed facts:', dropped.slice(0, 5));
+        }
+
+        // Stage 4: existing per-fact embed-and-store loop. Adds order based
+        // on array position so retrieval ordering matches the resume layout.
+        const factsWithOrder = valid.map((f, i) => ({ ...f, order: i }));
+        const result = await ingestFactList(factsWithOrder);
+        sendResponse({
+          ok: true,
+          ...result,
+          dropped: dropped.length,
+          llmLatencyMs: out.latencyMs,
+        });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });
       }
