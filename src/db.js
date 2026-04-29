@@ -1,11 +1,12 @@
-// Minimal IndexedDB wrapper. Six object stores:
+// Minimal IndexedDB wrapper. Seven object stores:
 //
-//   jobs                keyPath 'id'       — JD row metadata + match payload
-//   embeddings          keyPath 'jd_id'    — {jd_id, vector: Float32Array, dims}
-//   profiles            keyPath 'id'       — {id, name, short_label, version, created_at}
-//   profile_facts       keyPath 'id'       — one atomic claim per row, scoped by profile_id
-//   profile_embeddings  keyPath 'fact_id'  — {fact_id, profile_id, vector: Float32Array, dims}
-//   meta                keyPath 'key'      — small key/value (currently default_profile_id)
+//   jobs                  keyPath 'id'                        — JD row metadata + match payload
+//   embeddings            keyPath 'jd_id'                     — legacy whole-JD vector (dormant)
+//   jd_chunk_embeddings   keyPath ['jd_id', 'chunk_index']    — per-chunk JD vectors used for match
+//   profiles              keyPath 'id'                        — {id, name, short_label, version, created_at}
+//   profile_facts         keyPath 'id'                        — one atomic claim per row, scoped by profile_id
+//   profile_embeddings    keyPath 'fact_id'                   — {fact_id, profile_id, vector: Float32Array, dims}
+//   meta                  keyPath 'key'                       — small key/value (currently default_profile_id)
 //
 // Vectors are stored in separate stores so list/search queries don't
 // deserialize Float32Arrays they don't need.
@@ -14,13 +15,18 @@
 // the profile_id column / index. Each JD row remembers which profile its
 // cached match score was computed against (match_profile_id) so freshness
 // can be detected across both profile-version bumps and profile switches.
+//
+// JD chunks: match scoring embeds the JD as a list of atomic chunks rather
+// than one whole-JD vector. The legacy `embeddings` store stays around for
+// any old rows still pointing to it but is not written by the current path.
 
 import { JOB_STATUSES, DEFAULT_STATUS } from './constants.js';
 
 const DB_NAME = 'careerpilot-lite';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const STORE_JOBS = 'jobs';
 const STORE_EMBEDDINGS = 'embeddings';
+const STORE_JD_CHUNK_EMBEDDINGS = 'jd_chunk_embeddings';
 const STORE_PROFILES = 'profiles';
 const STORE_PROFILE_FACTS = 'profile_facts';
 const STORE_PROFILE_EMBEDDINGS = 'profile_embeddings';
@@ -116,6 +122,16 @@ function open() {
           };
         };
       }
+      if (oldVersion < 4) {
+        // JD chunk embeddings. Composite key (jd_id, chunk_index) so all
+        // chunks for one JD live together; jd_id index lets us getAll for
+        // scoring and delete-cascade. Existing rows have no chunks yet —
+        // they re-embed lazily on the next match recompute.
+        const chunks = db.createObjectStore(STORE_JD_CHUNK_EMBEDDINGS, {
+          keyPath: ['jd_id', 'chunk_index'],
+        });
+        chunks.createIndex('jd_id', 'jd_id', { unique: false });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -173,6 +189,7 @@ export async function addJob({
     match_computed_at: null,
     match_profile_version: null,
     match_profile_id: null,     // which profile the cached score was computed against
+    match_algo_version: null,   // scoring algo version; null means never computed
   };
   const t = tx(db, [STORE_JOBS], 'readwrite');
   await wrap(t.objectStore(STORE_JOBS).add(row));
@@ -192,10 +209,21 @@ export async function findJobByUrl(url) {
 
 export async function deleteJob(id) {
   const db = await open();
-  const t = tx(db, [STORE_JOBS, STORE_EMBEDDINGS], 'readwrite');
+  const t = tx(
+    db,
+    [STORE_JOBS, STORE_EMBEDDINGS, STORE_JD_CHUNK_EMBEDDINGS],
+    'readwrite',
+  );
+  // Cascade chunk rows by walking the jd_id index — composite-key stores
+  // can't delete by partial key directly.
+  const chunkIdx = t.objectStore(STORE_JD_CHUNK_EMBEDDINGS).index('jd_id');
+  const chunkKeys = await wrap(chunkIdx.getAllKeys(id));
   await Promise.all([
     wrap(t.objectStore(STORE_JOBS).delete(id)),
     wrap(t.objectStore(STORE_EMBEDDINGS).delete(id)),
+    ...chunkKeys.map((k) =>
+      wrap(t.objectStore(STORE_JD_CHUNK_EMBEDDINGS).delete(k)),
+    ),
   ]);
 }
 
@@ -244,6 +272,55 @@ export async function getEmbedding(jd_id) {
   const db = await open();
   const t = tx(db, [STORE_EMBEDDINGS], 'readonly');
   return wrap(t.objectStore(STORE_EMBEDDINGS).get(jd_id));
+}
+
+// Replace all chunk embeddings for a JD with the given list. Caller passes
+// chunks already in row shape ({chunk_index, chunk_text, vector, dims,
+// model_id, model_version}); we attach jd_id and normalize the vector to
+// Float32Array. Old chunks for this jd_id are wiped first so re-embed paths
+// (edit, cleanup, schema upgrade) don't leave stale rows behind.
+export async function putJdChunks(jd_id, chunks) {
+  if (!jd_id) throw new Error('putJdChunks: jd_id required');
+  const db = await open();
+  const t = tx(db, [STORE_JD_CHUNK_EMBEDDINGS], 'readwrite');
+  const store = t.objectStore(STORE_JD_CHUNK_EMBEDDINGS);
+  const oldKeys = await wrap(store.index('jd_id').getAllKeys(jd_id));
+  await Promise.all(oldKeys.map((k) => wrap(store.delete(k))));
+  await Promise.all(
+    chunks.map((c) => {
+      const buf =
+        c.vector instanceof Float32Array
+          ? c.vector
+          : new Float32Array(c.vector);
+      return wrap(
+        store.put({
+          jd_id,
+          chunk_index: c.chunk_index,
+          chunk_text: c.chunk_text,
+          vector: buf,
+          dims: c.dims,
+          model_id: c.model_id,
+          model_version: c.model_version,
+        }),
+      );
+    }),
+  );
+}
+
+export async function getJdChunks(jd_id) {
+  const db = await open();
+  const t = tx(db, [STORE_JD_CHUNK_EMBEDDINGS], 'readonly');
+  const idx = t.objectStore(STORE_JD_CHUNK_EMBEDDINGS).index('jd_id');
+  const rows = await wrap(idx.getAll(jd_id));
+  return rows.sort((a, b) => a.chunk_index - b.chunk_index);
+}
+
+export async function deleteJdChunks(jd_id) {
+  const db = await open();
+  const t = tx(db, [STORE_JD_CHUNK_EMBEDDINGS], 'readwrite');
+  const store = t.objectStore(STORE_JD_CHUNK_EMBEDDINGS);
+  const keys = await wrap(store.index('jd_id').getAllKeys(jd_id));
+  await Promise.all(keys.map((k) => wrap(store.delete(k))));
 }
 
 export async function getJob(id) {
@@ -528,4 +605,29 @@ export async function profileCosineSearch(queryVector, { profileId, topK = 8 } =
   }));
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, topK);
+}
+
+// Batched variant for JD-chunk asymmetric matching: loads the profile's
+// embeddings once and scores every query against them. Returns an array
+// parallel to queryVectors, each element a top-K list. With ~30 chunks ×
+// ~50 facts this saves ~30× redundant getAll() deserialization.
+export async function profileCosineSearchBatch(
+  queryVectors,
+  { profileId, topKPerQuery = 1 } = {},
+) {
+  if (!profileId) throw new Error('profileCosineSearchBatch: profileId required');
+  if (!Array.isArray(queryVectors) || queryVectors.length === 0) return [];
+  const db = await open();
+  const t = tx(db, [STORE_PROFILE_EMBEDDINGS], 'readonly');
+  const idx = t.objectStore(STORE_PROFILE_EMBEDDINGS).index('profile_id');
+  const embs = await wrap(idx.getAll(profileId));
+  return queryVectors.map((q) => {
+    const qv = q instanceof Float32Array ? q : new Float32Array(q);
+    const scored = embs.map((e) => ({
+      fact_id: e.fact_id,
+      score: cosine(qv, e.vector),
+    }));
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, topKPerQuery);
+  });
 }

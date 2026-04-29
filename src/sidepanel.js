@@ -126,9 +126,15 @@ function getActiveProfileId(job) {
   return job.profile_id ?? defaultProfileId ?? null;
 }
 
+// Must stay in sync with MATCH_ALGO_VERSION in background.js. Bumping it
+// invalidates every cached match_score so the existing strikethrough +
+// Recompute UX picks up rows scored under the old algo.
+const MATCH_ALGO_VERSION = 'coverage-v1';
+
 function isMatchFresh(job) {
   if (job.match_score == null) return false;
   if (!job.match_profile_id) return false;
+  if (job.match_algo_version !== MATCH_ALGO_VERSION) return false;
   const activeId = getActiveProfileId(job);
   if (job.match_profile_id !== activeId) return false;
   const profile = profilesById.get(activeId);
@@ -688,9 +694,16 @@ function renderMatchSection() {
   const staleTag = !fresh && score != null
     ? `<span class="stale-tag">stale</span>`
     : '';
+  const facts = fresh ? currentJobMatchFacts : null;
+  const STRONG_THRESHOLD = 0.45;
+  const strongCount = facts
+    ? facts.filter((f) => f.score >= STRONG_THRESHOLD).length
+    : 0;
   const subLabel = score == null
     ? 'not yet computed'
-    : `avg of top ${(currentJobMatchFacts ?? job.match_facts ?? []).length} facts`;
+    : facts && facts.length
+      ? `${strongCount} of ${facts.length} JD requirements have a strong profile match`
+      : 'top facts unavailable';
   const profilePickerHtml = `
     <label class="match-profile-label" style="display:inline-flex; gap:6px; align-items:center; font-size:11px; opacity:0.75;">
       Resume:
@@ -698,42 +711,49 @@ function renderMatchSection() {
     </label>
   `;
 
-  let factsHtml = '';
-  const facts = fresh ? currentJobMatchFacts : null;
-  if (facts && facts.length) {
-    const groups = new Map();
-    for (const f of facts) {
-      const key = f.section ?? '(no section)';
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(f);
-    }
-    factsHtml = [...groups.entries()]
-      .map(([sectionName, list]) => {
-        const items = list
-          .map((f) => {
-            const breadcrumb = [f.section, f.subsection].filter(Boolean).join(' › ');
-            const breadcrumbHtml = f.subsection
-              ? `<div class="meta" style="font-size:10px; opacity:0.55;">${escapeHtml(breadcrumb)}</div>`
-              : '';
-            return `
-              <div class="fact">
-                <span class="score">${(f.score * 100).toFixed(0)}%</span>
-                <div>
-                  ${breadcrumbHtml}
-                  <div>${escapeHtml(f.text)}</div>
-                </div>
-              </div>
-            `;
-          })
-          .join('');
-        return `
-          <div class="section-block">
-            <div class="section-name">${escapeHtml(sectionName)}</div>
-            ${items}
+  function renderChunkRow(f) {
+    const breadcrumb = [f.section, f.subsection].filter(Boolean).join(' › ');
+    const factBlock = f.fact_id
+      ? `
+          <div class="match-chunk-fact">
+            ${breadcrumb ? `<div class="meta" style="font-size:10px; opacity:0.55;">${escapeHtml(breadcrumb)}</div>` : ''}
+            <div>${escapeHtml(f.text ?? '')}</div>
           </div>
-        `;
-      })
-      .join('');
+        `
+      : `<div class="match-chunk-fact"><div class="meta" style="font-size:11px; opacity:0.65;">no strong profile match</div></div>`;
+    return `
+      <div class="fact">
+        <span class="score">${(f.score * 100).toFixed(0)}%</span>
+        <div>
+          <div class="match-chunk-text">${escapeHtml(f.chunk_text ?? '')}</div>
+          ${factBlock}
+        </div>
+      </div>
+    `;
+  }
+
+  let factsHtml = '';
+  if (facts && facts.length) {
+    const sorted = [...facts].sort((a, b) => b.score - a.score);
+    const strong = sorted.filter((f) => f.score >= STRONG_THRESHOLD);
+    const gaps = sorted.filter((f) => f.score < STRONG_THRESHOLD);
+    const strongBlock = strong.length
+      ? `
+          <div class="section-block">
+            <div class="section-name">Strong matches</div>
+            ${strong.map(renderChunkRow).join('')}
+          </div>
+        `
+      : '';
+    const gapsBlock = gaps.length
+      ? `
+          <div class="section-block">
+            <div class="section-name">Gaps</div>
+            ${gaps.map(renderChunkRow).join('')}
+          </div>
+        `
+      : '';
+    factsHtml = strongBlock + gapsBlock;
   }
 
   const factsBlock = factsHtml

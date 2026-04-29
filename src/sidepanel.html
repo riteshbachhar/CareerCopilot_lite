@@ -605,6 +605,17 @@
         flex-shrink: 0;
         min-width: 36px;
       }
+      /* JD-chunk coverage view: each row shows the JD chunk text with the
+         best matching profile fact indented underneath it. */
+      .match-facts .match-chunk-text {
+        font-weight: 500;
+      }
+      .match-facts .match-chunk-fact {
+        margin-top: 2px;
+        padding-left: 8px;
+        border-left: 1px dotted var(--line);
+        opacity: 0.85;
+      }
       .match-actions {
         display: flex;
         gap: 8px;

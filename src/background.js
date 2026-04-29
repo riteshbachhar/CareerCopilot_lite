@@ -1,8 +1,8 @@
 import {
   addJob,
   findJobByUrl,
-  putEmbedding,
-  getEmbedding,
+  putJdChunks,
+  getJdChunks,
   listJobs,
   getJob,
   setStatus,
@@ -25,7 +25,8 @@ import {
 } from './db.js';
 import { extractJobPostingFromPage } from './adapters/json-ld.js';
 import { parseProfileMarkdown } from './profile/parse-markdown.js';
-import { computeMatch } from './match.js';
+import { chunkJD } from './chunk-jd.js';
+import { computeMatchCoverage } from './match-coverage.js';
 import {
   cleanupJd,
   extractResumeFacts,
@@ -39,6 +40,12 @@ import {
 } from './llm/settings.js';
 
 const OFFSCREEN_URL = 'offscreen.html';
+
+// Bumped whenever the match-scoring algorithm changes shape. Rows whose
+// match_algo_version doesn't match this constant are treated as stale by
+// the side panel, forcing a recompute via the existing strikethrough +
+// Recompute UX rather than silently coexisting at incomparable scales.
+const MATCH_ALGO_VERSION = 'coverage-v1';
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -77,13 +84,52 @@ async function embedViaOffscreen(text) {
   return resp;
 }
 
-// Build the text that actually gets embedded. Title / company / location
-// are part of the JD's semantic identity, so include them as a header
-// line followed by the body. Keeps the stored raw_text clean while the
-// vector reflects the full role context.
-function buildEmbedText({ title, company, location, raw_text }) {
-  const header = [title, company, location].filter(Boolean).join(' · ');
-  return [header, raw_text].filter(Boolean).join('\n\n');
+// Chunk a JD and embed every chunk via the offscreen pipeline. Returns
+// the row payload ready for putJdChunks plus the first-chunk telemetry
+// (cold-start ms only fires once per service-worker lifetime, on the
+// first embed call). Used by capture, edit-with-raw_text-change, and
+// the lazy-rechunk path inside computeAndPersistMatch.
+async function chunkAndEmbedJD({ raw_text, cleaned_text }) {
+  const chunks = chunkJD({ raw_text, cleaned_text });
+  if (chunks.length === 0) {
+    return { chunkRows: [], coldStartMs: 0, embedMs: 0, modelId: null, modelVersion: null };
+  }
+  let coldStartMs = 0;
+  let embedMs = 0;
+  let modelId = null;
+  let modelVersion = null;
+  const chunkRows = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const out = await embedViaOffscreen(chunks[i]);
+    if (i === 0) {
+      coldStartMs = out.coldStartMs ?? 0;
+      embedMs = out.embedMs ?? 0;
+      modelId = out.modelId;
+      modelVersion = out.modelVersion;
+    }
+    chunkRows.push({
+      chunk_index: i,
+      chunk_text: chunks[i],
+      vector: out.vector,
+      dims: out.dims,
+      model_id: out.modelId,
+      model_version: out.modelVersion,
+    });
+  }
+  return { chunkRows, coldStartMs, embedMs, modelId, modelVersion };
+}
+
+// Re-chunk and re-embed a JD from its current row state, persisting the
+// fresh chunks. Returns the row list (already sorted by chunk_index, in
+// the same shape getJdChunks returns) so callers can pass them straight
+// to computeMatchCoverage.
+async function rechunkAndEmbed(jdId, job) {
+  const { chunkRows } = await chunkAndEmbedJD({
+    raw_text: job.raw_text,
+    cleaned_text: job.cleaned_text ?? null,
+  });
+  await putJdChunks(jdId, chunkRows);
+  return chunkRows;
 }
 
 // User tag input is untrusted — trim, dedupe (case-sensitive to preserve
@@ -177,25 +223,32 @@ async function resolveActiveProfileId(jobOrId) {
 // (cheap) instead of re-embedding. No-op when no profile exists at all.
 // Writes match_profile_id alongside score / facts / version so freshness
 // can be detected across profile-version bumps AND profile switches.
-async function computeAndPersistMatch(jdId, jdVector, profileIdOverride) {
+async function computeAndPersistMatch(jdId, profileIdOverride) {
   const job = await getJob(jdId);
   if (!job) return null;
   const profileId = profileIdOverride ?? (await resolveActiveProfileId(job));
   if (!profileId) return null; // no profiles exist yet
   const profile = await getProfile(profileId);
   if (!profile) return null; // dangling pointer, treat as no-op
-  const vec =
-    jdVector ??
-    (await getEmbedding(jdId))?.vector ??
-    null;
-  if (!vec) return null;
-  const { score, top_facts } = await computeMatch(vec, { profileId });
+  // Look for cached chunk vectors first; if missing (legacy row from before
+  // the coverage-v1 algo, or a row whose chunks were evicted), re-chunk and
+  // re-embed from the current raw_text/cleaned_text. This is what makes the
+  // existing bulk Recompute button do the right thing for old rows: first
+  // hit re-embeds, subsequent recomputes are cheap.
+  let chunks = await getJdChunks(jdId);
+  if (!chunks.length) {
+    if (!job.raw_text) return null;
+    chunks = await rechunkAndEmbed(jdId, job);
+    if (!chunks.length) return null; // degenerate JD, all chunks filtered
+  }
+  const { score, top_facts } = await computeMatchCoverage(chunks, { profileId });
   await updateJob(jdId, {
     match_score: score,
     match_facts: top_facts,
     match_computed_at: Date.now(),
     match_profile_version: profile.version,
     match_profile_id: profileId,
+    match_algo_version: MATCH_ALGO_VERSION,
   });
   return {
     score,
@@ -232,14 +285,8 @@ async function persistCapture({
     }
   }
 
-  const embedInput = buildEmbedText({
-    title,
-    company,
-    location,
-    raw_text: text,
-  });
-  const { vector, dims, modelId, modelVersion, coldStartMs, embedMs } =
-    await embedViaOffscreen(embedInput);
+  const { chunkRows, coldStartMs, embedMs, modelId, modelVersion } =
+    await chunkAndEmbedJD({ raw_text: text, cleaned_text: null });
 
   const row = await addJob({
     url: url ?? null,
@@ -255,8 +302,10 @@ async function persistCapture({
     model_id: modelId,
     model_version: modelVersion,
   });
-  await putEmbedding({ jd_id: row.id, vector, dims });
-  await computeAndPersistMatch(row.id, vector);
+  if (chunkRows.length) {
+    await putJdChunks(row.id, chunkRows);
+    await computeAndPersistMatch(row.id);
+  }
 
   return {
     id: row.id,
@@ -360,9 +409,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         if (row?.match_facts?.length) {
           hydrated_match_facts = await Promise.all(
             row.match_facts.map(async (f) => {
-              const fact = await getProfileFact(f.fact_id);
+              const fact = f.fact_id ? await getProfileFact(f.fact_id) : null;
               return {
-                fact_id: f.fact_id,
+                chunk_index: f.chunk_index ?? null,
+                chunk_text: f.chunk_text ?? null,
+                fact_id: f.fact_id ?? null,
                 score: f.score,
                 section: fact?.section ?? null,
                 subsection: fact?.subsection ?? null,
@@ -435,23 +486,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           changes.oneliner = null;
         }
 
-        let vector = null;
         if (embedDirty) {
-          const embedInput = buildEmbedText({
-            title: nextTitle,
-            company: nextCompany,
-            location: nextLocation,
+          // raw_text changes invalidate cleaned_text earlier in this handler,
+          // so the chunker correctly falls back to raw-text mode below.
+          const cleanedForChunk =
+            'cleaned_text' in changes
+              ? (changes.cleaned_text ?? null)
+              : (existing.cleaned_text ?? null);
+          const { chunkRows, modelId, modelVersion } = await chunkAndEmbedJD({
             raw_text: nextRawText,
+            cleaned_text: cleanedForChunk,
           });
-          const out = await embedViaOffscreen(embedInput);
-          vector = out.vector;
-          await putEmbedding({ jd_id: id, vector, dims: out.dims });
-          changes.model_id = out.modelId;
-          changes.model_version = out.modelVersion;
+          await putJdChunks(id, chunkRows);
+          changes.model_id = modelId ?? existing.model_id;
+          changes.model_version = modelVersion ?? existing.model_version;
         }
 
         const next = await updateJob(id, changes);
-        if (embedDirty) await computeAndPersistMatch(id, vector);
+        if (embedDirty) await computeAndPersistMatch(id);
         sendResponse({
           ok: true,
           id,
@@ -670,6 +722,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
         const jobs = await listJobs();
         const stale = jobs.filter((j) => {
+          if (j.match_algo_version !== MATCH_ALGO_VERSION) return true;
           const activeId = j.profile_id ?? defaultId;
           if (j.match_profile_id !== activeId) return true;
           const expectedVersion = versionById.get(activeId);
@@ -925,11 +978,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           cleaned_at: Date.now(),
           oneliner: out.oneliner ?? null,
         });
+        // The cleaned markdown's section/bullet structure produces better-
+        // shaped chunks than the raw_text fallback path. Re-chunk + rescore
+        // so the chip reflects the improved signal.
+        await rechunkAndEmbed(id, next);
+        await computeAndPersistMatch(id);
+        const refreshed = await getJob(id);
         sendResponse({
           ok: true,
           cleaned: true,
           latencyMs: out.latencyMs,
-          job: next,
+          job: refreshed,
         });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });
