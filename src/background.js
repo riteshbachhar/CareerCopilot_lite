@@ -27,6 +27,8 @@ import { extractJobPostingFromPage } from './adapters/json-ld.js';
 import { parseProfileMarkdown } from './profile/parse-markdown.js';
 import { chunkJD } from './chunk-jd.js';
 import { computeMatchCoverage } from './match-coverage.js';
+import { parseImportText } from './import-jobs.js';
+import { JOB_STATUSES, DEFAULT_STATUS } from './constants.js';
 import {
   cleanupJd,
   extractResumeFacts,
@@ -400,6 +402,40 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  // Full job rows for the JSON-backup export path. Returns raw_text,
+  // cleaned_text, and oneliner (which the slim 'list' handler strips) so
+  // the export can round-trip back through the importer's re-embed path.
+  // Match payload (match_score / match_facts / etc.) is intentionally
+  // dropped — re-embed regenerates it from the active profile on import.
+  if (msg.type === 'export-jobs') {
+    (async () => {
+      try {
+        const jobs = await listJobs();
+        const rows = jobs.map((j) => ({
+          id: j.id,
+          url: j.url,
+          title: j.title,
+          company: j.company,
+          timestamp: j.timestamp,
+          raw_text: j.raw_text,
+          cleaned_text: j.cleaned_text ?? null,
+          cleaned_at: j.cleaned_at ?? null,
+          oneliner: j.oneliner ?? null,
+          structured_fields: j.structured_fields ?? null,
+          status: j.status,
+          status_history: j.status_history ?? null,
+          notes: j.notes ?? null,
+          follow_up_at: j.follow_up_at ?? null,
+          tags: j.tags ?? [],
+        }));
+        sendResponse({ ok: true, rows });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
   if (msg.type === 'get') {
     (async () => {
       try {
@@ -742,6 +778,126 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             .catch(() => {});
         }
         sendResponse({ ok: true, updated: done, total: stale.length });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  // Re-ingest jobs from a CSV or JSON backup file. Each row is parsed,
+  // deduped against existing rows by URL, then run through the same
+  // chunk-and-embed path as a fresh capture so the new install ends up
+  // with identical chunk vectors / match scores. Per-row failures are
+  // collected and surfaced; one bad row never aborts the rest of the file.
+  if (msg.type === 'import-jobs') {
+    (async () => {
+      try {
+        const { text, format } = msg;
+        const parsed = parseImportText(text, { format });
+        const total = parsed.rows.length;
+        const errors = [...parsed.errors];
+        if (!total) {
+          sendResponse({ ok: true, imported: 0, skipped: 0, failed: 0, total: 0, errors });
+          return;
+        }
+        let imported = 0;
+        let skipped = 0;
+        let failed = 0;
+        let done = 0;
+        for (const row of parsed.rows) {
+          try {
+            // Dedupe by URL — match the existing capture pattern. Paste
+            // captures (no URL) bypass dedupe, so paste-imported rows can
+            // legitimately appear multiple times if the file has them.
+            if (row.url) {
+              const existing = await findJobByUrl(row.url);
+              if (existing) {
+                skipped += 1;
+                done += 1;
+                chrome.runtime
+                  .sendMessage({
+                    target: 'sidepanel',
+                    type: 'import-progress',
+                    done,
+                    total,
+                    imported,
+                    skipped,
+                    failed,
+                  })
+                  .catch(() => {});
+                continue;
+              }
+            }
+            const status = JOB_STATUSES.includes(row.status)
+              ? row.status
+              : DEFAULT_STATUS;
+            const created = await addJob({
+              url: row.url,
+              title: row.title,
+              company: row.company,
+              raw_text: row.raw_text,
+              structured_fields: row.structured_fields,
+              model_id: null,
+              model_version: null,
+            });
+            // Apply imported metadata that addJob defaults differently.
+            // status_history from the import overrides the single-entry
+            // default; if absent, we leave the default in place.
+            const patch = {};
+            if (row.timestamp) patch.timestamp = row.timestamp;
+            if (status !== DEFAULT_STATUS || row.status_history) {
+              patch.status = status;
+              patch.status_history = row.status_history ?? [
+                { status, at: row.timestamp ?? Date.now() },
+              ];
+            }
+            if (row.notes) patch.notes = row.notes;
+            if (row.follow_up_at) patch.follow_up_at = row.follow_up_at;
+            if (row.tags?.length) patch.tags = normalizeTags(row.tags);
+            if (row.cleaned_text) {
+              patch.cleaned_text = row.cleaned_text;
+              patch.cleaned_at = row.timestamp ?? Date.now();
+            }
+            if (row.oneliner) patch.oneliner = row.oneliner;
+            if (Object.keys(patch).length) await updateJob(created.id, patch);
+
+            // Re-embed: chunk → embed each → store. Use cleaned_text when
+            // present so the chunker takes advantage of structured markdown.
+            const { chunkRows, modelId, modelVersion } = await chunkAndEmbedJD({
+              raw_text: row.raw_text,
+              cleaned_text: row.cleaned_text,
+            });
+            if (chunkRows.length) {
+              await putJdChunks(created.id, chunkRows);
+              await updateJob(created.id, {
+                model_id: modelId,
+                model_version: modelVersion,
+              });
+              await computeAndPersistMatch(created.id);
+            }
+            imported += 1;
+          } catch (err) {
+            failed += 1;
+            errors.push({
+              where: row.url ?? row.title ?? '(row)',
+              message: String(err?.message ?? err),
+            });
+          }
+          done += 1;
+          chrome.runtime
+            .sendMessage({
+              target: 'sidepanel',
+              type: 'import-progress',
+              done,
+              total,
+              imported,
+              skipped,
+              failed,
+            })
+            .catch(() => {});
+        }
+        sendResponse({ ok: true, imported, skipped, failed, total, errors });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });
       }

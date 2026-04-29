@@ -1043,6 +1043,23 @@
           <span id="export-status" class="status"></span>
         </div>
       </details>
+
+      <details>
+        <summary class="profile-facts-summary">Import jobs</summary>
+        <div style="margin-top: 8px; display: flex; flex-direction: column; gap: 8px; font-size: 11px;">
+          <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+            <input id="import-file" type="file" accept=".json,.csv,application/json,text/csv" style="font-size: 11px;" />
+            <button id="import-run" disabled>Import</button>
+          </div>
+          <div id="import-progress" class="progress" hidden>
+            <div id="import-progress-fill" class="progress-fill"></div>
+          </div>
+          <span id="import-status" class="status"></span>
+          <span style="opacity: 0.6; font-size: 10px;">
+            Skips rows whose URL already exists. JSON has full body; CSV has only the preview, so re-embed quality is lower.
+          </span>
+        </div>
+      </details>
     </div>
 
     <!-- ==================== Add profile modal ==================== -->

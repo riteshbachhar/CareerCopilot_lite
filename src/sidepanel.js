@@ -1851,7 +1851,10 @@ function exportFilename(format) {
   return `careerpilot-jobs-${stamp}.${format}`;
 }
 
-function jobToExportRow(job, redact) {
+// Flat row shape used for CSV export. `job` here is the slim cachedJobs row
+// (preview only, no raw_text); the JSON export uses a separate full-row path
+// via the background's 'export-jobs' handler.
+function jobToCsvRow(job, redact) {
   const sf = job.structured_fields ?? {};
   const followUp = job.follow_up_at
     ? new Date(job.follow_up_at).toISOString().slice(0, 10)
@@ -1912,26 +1915,35 @@ async function handleExport(format) {
   exportStatus.className = 'status';
   exportStatus.textContent = 'gathering…';
   try {
-    // refreshJobs() already populated cachedJobs; reuse so we don't bother
-    // the background. Note: cachedJobs holds preview, not raw_text — for
-    // plain export that's the right tradeoff (preview avoids dumping
-    // 50KB JD bodies into a CSV by accident).
     if (!cachedJobs.length) {
       exportStatus.textContent = 'nothing to export';
       return;
     }
     const redact = !!exportRedact.checked;
-    const rows = cachedJobs.map((j) => jobToExportRow(j, redact));
     let blob;
     if (format === 'csv') {
+      // CSV stays preview-only — packing a 50KB raw_text into a single
+      // quoted cell makes the output unreadable in most CSV viewers, and
+      // the human use case for CSV is the analytics view, not backup.
+      const rows = cachedJobs.map((j) => jobToCsvRow(j, redact));
       blob = new Blob([rowsToCsv(rows)], { type: 'text/csv;charset=utf-8' });
+      downloadBlob(blob, exportFilename(format));
+      exportStatus.textContent = `exported ${rows.length} row(s) (preview-only — use JSON for full backup)`;
     } else {
+      // JSON is the full-fidelity backup format: includes raw_text,
+      // cleaned_text, and oneliner so the importer can re-embed and
+      // restore an identical state on another machine.
+      const resp = await send('export-jobs');
+      if (!resp?.ok) throw new Error(resp?.error ?? 'export failed');
+      const rows = redact
+        ? resp.rows.map((r) => ({ ...r, notes: null }))
+        : resp.rows;
       blob = new Blob([JSON.stringify(rows, null, 2)], {
         type: 'application/json',
       });
+      downloadBlob(blob, exportFilename(format));
+      exportStatus.textContent = `exported ${rows.length} row(s)`;
     }
-    downloadBlob(blob, exportFilename(format));
-    exportStatus.textContent = `exported ${rows.length} row(s)`;
   } catch (err) {
     exportStatus.className = 'status error';
     exportStatus.textContent = `error: ${String(err?.message ?? err)}`;
@@ -1940,6 +1952,66 @@ async function handleExport(format) {
 
 exportCsvBtn.addEventListener('click', () => handleExport('csv'));
 exportJsonBtn.addEventListener('click', () => handleExport('json'));
+
+// ---------- Import ----------
+
+const importFileInput = $('import-file');
+const importRunBtn = $('import-run');
+const importStatus = $('import-status');
+const importProgress = $('import-progress');
+const importProgressFill = $('import-progress-fill');
+
+function setImportProgress(done, total) {
+  if (!total) {
+    importProgress.hidden = true;
+    importProgressFill.style.width = '0%';
+    return;
+  }
+  importProgress.hidden = false;
+  importProgressFill.style.width = `${Math.min(100, (done / total) * 100)}%`;
+}
+
+importFileInput.addEventListener('change', () => {
+  importRunBtn.disabled = !importFileInput.files?.length;
+  importStatus.className = 'status';
+  importStatus.textContent = '';
+});
+
+importRunBtn.addEventListener('click', async () => {
+  const file = importFileInput.files?.[0];
+  if (!file) return;
+  importRunBtn.disabled = true;
+  importStatus.className = 'status';
+  importStatus.textContent = 'reading file…';
+  setImportProgress(0, 0);
+  try {
+    const text = await file.text();
+    // Heuristic format hint from extension; the parser auto-detects too.
+    const ext = file.name.toLowerCase().split('.').pop();
+    const format = ext === 'csv' ? 'csv' : ext === 'json' ? 'json' : undefined;
+    importStatus.textContent = 'embedding rows…';
+    const resp = await send('import-jobs', { text, format });
+    if (!resp?.ok) throw new Error(resp?.error ?? 'import failed');
+    const { imported, skipped, failed, total, errors } = resp;
+    const parts = [`${imported} imported`];
+    if (skipped) parts.push(`${skipped} skipped (already present)`);
+    if (failed) parts.push(`${failed} failed`);
+    if (errors?.length && imported === 0 && skipped === 0) {
+      importStatus.className = 'status error';
+      importStatus.textContent = `error: ${errors[0].message}`;
+    } else {
+      importStatus.textContent = `${parts.join(', ')} of ${total}`;
+    }
+    setImportProgress(0, 0);
+    importFileInput.value = '';
+    await refreshJobs();
+  } catch (err) {
+    importStatus.className = 'status error';
+    importStatus.textContent = `error: ${String(err?.message ?? err)}`;
+  } finally {
+    importRunBtn.disabled = !importFileInput.files?.length;
+  }
+});
 
 // ---------- Init: sort dropdown ----------
 
@@ -1969,6 +2041,10 @@ chrome.runtime.onMessage.addListener((msg) => {
   } else if (msg.type === 'recompute-progress') {
     // Optional: surface in the recompute banner. For now, just leave it
     // silent — the final refreshJobs() after the call resolves updates UI.
+  } else if (msg.type === 'import-progress') {
+    setImportProgress(msg.done, msg.total);
+    importStatus.className = 'status';
+    importStatus.textContent = `${msg.imported} imported, ${msg.skipped} skipped of ${msg.done} / ${msg.total}…`;
   }
   return false;
 });
