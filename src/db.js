@@ -1,20 +1,27 @@
-// Minimal IndexedDB wrapper. Five object stores:
+// Minimal IndexedDB wrapper. Six object stores:
 //
 //   jobs                keyPath 'id'       — JD row metadata + match payload
 //   embeddings          keyPath 'jd_id'    — {jd_id, vector: Float32Array, dims}
-//   profile_facts       keyPath 'id'       — one atomic claim per row (from profile.md)
-//   profile_embeddings  keyPath 'fact_id'  — {fact_id, vector: Float32Array, dims}
-//   meta                keyPath 'key'      — small key/value (currently profile_version)
+//   profiles            keyPath 'id'       — {id, name, short_label, version, created_at}
+//   profile_facts       keyPath 'id'       — one atomic claim per row, scoped by profile_id
+//   profile_embeddings  keyPath 'fact_id'  — {fact_id, profile_id, vector: Float32Array, dims}
+//   meta                keyPath 'key'      — small key/value (currently default_profile_id)
 //
 // Vectors are stored in separate stores so list/search queries don't
 // deserialize Float32Arrays they don't need.
+//
+// Multi-profile: each profile holds its own facts + embeddings, scoped via
+// the profile_id column / index. Each JD row remembers which profile its
+// cached match score was computed against (match_profile_id) so freshness
+// can be detected across both profile-version bumps and profile switches.
 
 import { JOB_STATUSES, DEFAULT_STATUS } from './constants.js';
 
 const DB_NAME = 'careerpilot-lite';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE_JOBS = 'jobs';
 const STORE_EMBEDDINGS = 'embeddings';
+const STORE_PROFILES = 'profiles';
 const STORE_PROFILE_FACTS = 'profile_facts';
 const STORE_PROFILE_EMBEDDINGS = 'profile_embeddings';
 const STORE_META = 'meta';
@@ -45,6 +52,69 @@ function open() {
         if (!jobsStore.indexNames.contains('url')) {
           jobsStore.createIndex('url', 'url', { unique: false });
         }
+      }
+      if (oldVersion < 3) {
+        // Multi-profile schema:
+        //   - new `profiles` store
+        //   - profile_id index on facts and embeddings
+        //   - replace global meta.profile_version with per-profile versions
+        //   - migrate any existing profile data into one default 'My Profile'
+        const profiles = db.createObjectStore(STORE_PROFILES, { keyPath: 'id' });
+        profiles.createIndex('created_at', 'created_at');
+
+        const factsStore = req.transaction.objectStore(STORE_PROFILE_FACTS);
+        if (!factsStore.indexNames.contains('profile_id')) {
+          factsStore.createIndex('profile_id', 'profile_id', { unique: false });
+        }
+        const embsStore = req.transaction.objectStore(STORE_PROFILE_EMBEDDINGS);
+        if (!embsStore.indexNames.contains('profile_id')) {
+          embsStore.createIndex('profile_id', 'profile_id', { unique: false });
+        }
+
+        // Data backfill (queued on the upgrade tx so it stays open until done).
+        const upTx = req.transaction;
+        const factsAllReq = upTx.objectStore(STORE_PROFILE_FACTS).getAll();
+        factsAllReq.onsuccess = () => {
+          if (!factsAllReq.result.length) return; // empty install — nothing to migrate
+          const metaGet = upTx.objectStore(STORE_META).get('profile_version');
+          metaGet.onsuccess = () => {
+            const oldVer = metaGet.result?.value ?? String(Date.now());
+            const defaultId = crypto.randomUUID();
+            upTx.objectStore(STORE_PROFILES).add({
+              id: defaultId,
+              name: 'My Profile',
+              short_label: 'MINE',
+              version: oldVer,
+              created_at: Date.now(),
+            });
+            upTx.objectStore(STORE_META).put({
+              key: 'default_profile_id',
+              value: defaultId,
+            });
+            upTx.objectStore(STORE_META).delete('profile_version');
+
+            for (const f of factsAllReq.result) {
+              f.profile_id = defaultId;
+              upTx.objectStore(STORE_PROFILE_FACTS).put(f);
+            }
+            const embsAllReq = upTx.objectStore(STORE_PROFILE_EMBEDDINGS).getAll();
+            embsAllReq.onsuccess = () => {
+              for (const e of embsAllReq.result) {
+                e.profile_id = defaultId;
+                upTx.objectStore(STORE_PROFILE_EMBEDDINGS).put(e);
+              }
+            };
+            const jobsAllReq = upTx.objectStore(STORE_JOBS).getAll();
+            jobsAllReq.onsuccess = () => {
+              for (const j of jobsAllReq.result) {
+                if (j.match_score != null && j.match_profile_id == null) {
+                  j.match_profile_id = defaultId;
+                  upTx.objectStore(STORE_JOBS).put(j);
+                }
+              }
+            };
+          };
+        };
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -97,10 +167,12 @@ export async function addJob({
     notes: null,
     follow_up_at: null,
     tags: [],
+    profile_id: null,           // null → use default profile
     match_score: null,
     match_facts: null,
     match_computed_at: null,
     match_profile_version: null,
+    match_profile_id: null,     // which profile the cached score was computed against
   };
   const t = tx(db, [STORE_JOBS], 'readwrite');
   await wrap(t.objectStore(STORE_JOBS).add(row));
@@ -209,9 +281,148 @@ function cosine(a, b) {
   return denom === 0 ? 0 : dot / denom;
 }
 
+// ---------- Profiles ----------
+
+export async function addProfile({ name, short_label }) {
+  const db = await open();
+  const id = uuid();
+  const row = {
+    id,
+    name: String(name ?? '').trim() || 'Untitled profile',
+    short_label: deriveShortLabel(short_label, name),
+    version: String(Date.now()),
+    created_at: Date.now(),
+  };
+  const t = tx(db, [STORE_PROFILES], 'readwrite');
+  await wrap(t.objectStore(STORE_PROFILES).add(row));
+  return row;
+}
+
+function deriveShortLabel(explicit, name) {
+  const fromExplicit = String(explicit ?? '').trim();
+  if (fromExplicit) return fromExplicit.slice(0, 6);
+  const firstWord = String(name ?? '').trim().split(/\s+/)[0] ?? '';
+  return firstWord.slice(0, 6) || 'NEW';
+}
+
+export async function getProfile(id) {
+  const db = await open();
+  const t = tx(db, [STORE_PROFILES], 'readonly');
+  return wrap(t.objectStore(STORE_PROFILES).get(id));
+}
+
+export async function listProfiles() {
+  const db = await open();
+  const t = tx(db, [STORE_PROFILES], 'readonly');
+  const rows = await wrap(t.objectStore(STORE_PROFILES).index('created_at').getAll());
+  return rows;
+}
+
+// One pass: profiles + per-profile fact counts + the default flag.
+export async function listProfilesWithCounts() {
+  const db = await open();
+  const t = tx(db, [STORE_PROFILES, STORE_PROFILE_FACTS, STORE_META], 'readonly');
+  const profiles = await wrap(t.objectStore(STORE_PROFILES).index('created_at').getAll());
+  const defaultRow = await wrap(t.objectStore(STORE_META).get('default_profile_id'));
+  const defaultId = defaultRow?.value ?? null;
+  const counts = await Promise.all(
+    profiles.map((p) =>
+      wrap(t.objectStore(STORE_PROFILE_FACTS).index('profile_id').count(p.id)),
+    ),
+  );
+  return profiles.map((p, i) => ({
+    ...p,
+    fact_count: counts[i],
+    is_default: p.id === defaultId,
+  }));
+}
+
+export async function renameProfile(id, { name, short_label }) {
+  const db = await open();
+  const t = tx(db, [STORE_PROFILES], 'readwrite');
+  const store = t.objectStore(STORE_PROFILES);
+  const row = await wrap(store.get(id));
+  if (!row) throw new Error(`profile not found: ${id}`);
+  const next = { ...row };
+  if (typeof name === 'string') next.name = name.trim() || row.name;
+  if (typeof short_label === 'string') {
+    next.short_label = deriveShortLabel(short_label, next.name);
+  }
+  await wrap(store.put(next));
+  return next;
+}
+
+export async function setProfileVersion(id, version) {
+  const db = await open();
+  const t = tx(db, [STORE_PROFILES], 'readwrite');
+  const store = t.objectStore(STORE_PROFILES);
+  const row = await wrap(store.get(id));
+  if (!row) throw new Error(`profile not found: ${id}`);
+  row.version = version;
+  await wrap(store.put(row));
+  return row;
+}
+
+// Cascade-delete: profile, its facts, its embeddings. Does NOT mutate jobs.
+// Background.js handles clearing job.profile_id and job.match_profile_id where
+// they referenced this profile (since it also needs to trigger recompute).
+export async function deleteProfileCascade(id) {
+  const db = await open();
+  const t = tx(
+    db,
+    [STORE_PROFILES, STORE_PROFILE_FACTS, STORE_PROFILE_EMBEDDINGS, STORE_META],
+    'readwrite',
+  );
+  // Delete profile row
+  await wrap(t.objectStore(STORE_PROFILES).delete(id));
+  // Cursor-delete facts + embeddings by profile_id index
+  const factsIdx = t.objectStore(STORE_PROFILE_FACTS).index('profile_id');
+  await new Promise((resolve, reject) => {
+    const cur = factsIdx.openCursor(IDBKeyRange.only(id));
+    cur.onsuccess = () => {
+      const c = cur.result;
+      if (!c) return resolve();
+      c.delete();
+      c.continue();
+    };
+    cur.onerror = () => reject(cur.error);
+  });
+  const embsIdx = t.objectStore(STORE_PROFILE_EMBEDDINGS).index('profile_id');
+  await new Promise((resolve, reject) => {
+    const cur = embsIdx.openCursor(IDBKeyRange.only(id));
+    cur.onsuccess = () => {
+      const c = cur.result;
+      if (!c) return resolve();
+      c.delete();
+      c.continue();
+    };
+    cur.onerror = () => reject(cur.error);
+  });
+  // If we deleted the default, clear the default pointer (caller must pick a new one).
+  const meta = t.objectStore(STORE_META);
+  const defaultRow = await wrap(meta.get('default_profile_id'));
+  if (defaultRow?.value === id) {
+    await wrap(meta.delete('default_profile_id'));
+  }
+}
+
+export async function getDefaultProfileId() {
+  const db = await open();
+  const t = tx(db, [STORE_META], 'readonly');
+  const row = await wrap(t.objectStore(STORE_META).get('default_profile_id'));
+  return row?.value ?? null;
+}
+
+export async function setDefaultProfileId(id) {
+  const db = await open();
+  const t = tx(db, [STORE_META], 'readwrite');
+  await wrap(t.objectStore(STORE_META).put({ key: 'default_profile_id', value: id }));
+}
+
 // ---------- Profile facts ----------
 
 export async function addProfileFact({
+  profile_id,
   section,
   subsection,
   text,
@@ -219,9 +430,11 @@ export async function addProfileFact({
   model_id,
   model_version,
 }) {
+  if (!profile_id) throw new Error('addProfileFact: profile_id required');
   const db = await open();
   const row = {
     id: uuid(),
+    profile_id,
     section: section ?? null,
     subsection: subsection ?? null,
     text,
@@ -235,18 +448,23 @@ export async function addProfileFact({
   return row;
 }
 
-export async function putProfileEmbedding({ fact_id, vector, dims }) {
+export async function putProfileEmbedding({ fact_id, profile_id, vector, dims }) {
+  if (!profile_id) throw new Error('putProfileEmbedding: profile_id required');
   const db = await open();
   const t = tx(db, [STORE_PROFILE_EMBEDDINGS], 'readwrite');
   const buf = vector instanceof Float32Array ? vector : new Float32Array(vector);
-  await wrap(t.objectStore(STORE_PROFILE_EMBEDDINGS).put({ fact_id, vector: buf, dims }));
+  await wrap(
+    t.objectStore(STORE_PROFILE_EMBEDDINGS).put({ fact_id, profile_id, vector: buf, dims }),
+  );
 }
 
-export async function listProfileFacts() {
+export async function listProfileFacts(profileId) {
+  if (!profileId) throw new Error('listProfileFacts: profileId required');
   const db = await open();
   const t = tx(db, [STORE_PROFILE_FACTS], 'readonly');
-  const store = t.objectStore(STORE_PROFILE_FACTS);
-  return wrap(store.index('order').getAll());
+  const idx = t.objectStore(STORE_PROFILE_FACTS).index('profile_id');
+  const facts = await wrap(idx.getAll(profileId));
+  return facts.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 }
 
 export async function getProfileFact(id) {
@@ -255,59 +473,59 @@ export async function getProfileFact(id) {
   return wrap(t.objectStore(STORE_PROFILE_FACTS).get(id));
 }
 
-export async function countProfileFacts() {
+export async function countProfileFacts(profileId) {
   const db = await open();
   const t = tx(db, [STORE_PROFILE_FACTS], 'readonly');
+  if (profileId) {
+    return wrap(t.objectStore(STORE_PROFILE_FACTS).index('profile_id').count(profileId));
+  }
   return wrap(t.objectStore(STORE_PROFILE_FACTS).count());
 }
 
-export async function getAllProfileEmbeddings() {
-  const db = await open();
-  const t = tx(db, [STORE_PROFILE_EMBEDDINGS], 'readonly');
-  return wrap(t.objectStore(STORE_PROFILE_EMBEDDINGS).getAll());
-}
-
-export async function clearProfile() {
+// Wipe one profile's facts + embeddings (keeps the profile row itself).
+export async function clearProfile(profileId) {
+  if (!profileId) throw new Error('clearProfile: profileId required');
   const db = await open();
   const t = tx(db, [STORE_PROFILE_FACTS, STORE_PROFILE_EMBEDDINGS], 'readwrite');
-  await Promise.all([
-    wrap(t.objectStore(STORE_PROFILE_FACTS).clear()),
-    wrap(t.objectStore(STORE_PROFILE_EMBEDDINGS).clear()),
-  ]);
+  const factsIdx = t.objectStore(STORE_PROFILE_FACTS).index('profile_id');
+  await new Promise((resolve, reject) => {
+    const cur = factsIdx.openCursor(IDBKeyRange.only(profileId));
+    cur.onsuccess = () => {
+      const c = cur.result;
+      if (!c) return resolve();
+      c.delete();
+      c.continue();
+    };
+    cur.onerror = () => reject(cur.error);
+  });
+  const embsIdx = t.objectStore(STORE_PROFILE_EMBEDDINGS).index('profile_id');
+  await new Promise((resolve, reject) => {
+    const cur = embsIdx.openCursor(IDBKeyRange.only(profileId));
+    cur.onsuccess = () => {
+      const c = cur.result;
+      if (!c) return resolve();
+      c.delete();
+      c.continue();
+    };
+    cur.onerror = () => reject(cur.error);
+  });
 }
 
-// Mirror of cosineSearch over the profile corpus. Returns {fact_id, score}
-// pairs so the caller can hydrate text + breadcrumb from profile_facts.
-export async function profileCosineSearch(queryVector, { topK = 8 } = {}) {
+// Cosine search over one profile's embeddings. Returns {fact_id, score} pairs
+// for the caller to hydrate text + breadcrumb from profile_facts.
+export async function profileCosineSearch(queryVector, { profileId, topK = 8 } = {}) {
+  if (!profileId) throw new Error('profileCosineSearch: profileId required');
   const q = queryVector instanceof Float32Array
     ? queryVector
     : new Float32Array(queryVector);
-  const embs = await getAllProfileEmbeddings();
+  const db = await open();
+  const t = tx(db, [STORE_PROFILE_EMBEDDINGS], 'readonly');
+  const idx = t.objectStore(STORE_PROFILE_EMBEDDINGS).index('profile_id');
+  const embs = await wrap(idx.getAll(profileId));
   const scored = embs.map((e) => ({
     fact_id: e.fact_id,
     score: cosine(q, e.vector),
   }));
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, topK);
-}
-
-// ---------- Meta (profile_version etc.) ----------
-
-export async function getProfileVersion() {
-  const db = await open();
-  const t = tx(db, [STORE_META], 'readonly');
-  const row = await wrap(t.objectStore(STORE_META).get('profile_version'));
-  return row?.value ?? null;
-}
-
-export async function setProfileVersion(value) {
-  const db = await open();
-  const t = tx(db, [STORE_META], 'readwrite');
-  await wrap(t.objectStore(STORE_META).put({ key: 'profile_version', value }));
-}
-
-export async function clearProfileVersion() {
-  const db = await open();
-  const t = tx(db, [STORE_META], 'readwrite');
-  await wrap(t.objectStore(STORE_META).delete('profile_version'));
 }

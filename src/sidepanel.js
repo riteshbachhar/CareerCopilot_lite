@@ -36,27 +36,27 @@ const recomputeAllBtn = $('recompute-all-btn');
 const detailView = $('detail-view');
 const detailContent = $('detail-content');
 
-// Profile drawer
+// Profile drawer (multi-resume)
 const profileBackdrop = $('profile-backdrop');
 const profileDrawer = $('profile-drawer');
 const closeProfileBtn = $('close-profile');
-const profileSummary = $('profile-summary');
-const profileFile = $('profile-file');
-const profilePaste = $('profile-paste');
-const ingestProfileBtn = $('ingest-profile');
-const clearProfileBtn = $('clear-profile');
+const addProfileBtn = $('add-profile-btn');
+const profileList = $('profile-list');
 const profileStatus = $('profile-status');
 const ingestProgress = $('ingest-progress');
 const ingestProgressFill = $('ingest-progress-fill');
-const profileFactsDetails = $('profile-facts-details');
-const profileMetrics = $('profile-metrics');
-const profileFactsList = $('profile-facts-list');
-const resumeFile = $('resume-file');
-const resumeUploadBtn = $('resume-upload-btn');
 const exportCsvBtn = $('export-csv');
 const exportJsonBtn = $('export-json');
 const exportRedact = $('export-redact');
 const exportStatus = $('export-status');
+
+// Add-profile modal
+const addProfileOverlay = $('add-profile-overlay');
+const newProfileName = $('new-profile-name');
+const newProfileShort = $('new-profile-short');
+const newProfileCreate = $('new-profile-create');
+const newProfileCancel = $('new-profile-cancel');
+const newProfileStatus = $('new-profile-status');
 
 // Settings drawer
 const settingsBackdrop = $('settings-backdrop');
@@ -79,7 +79,11 @@ let currentJobFull = null;
 let currentJobMatchFacts = null;
 let isEditMode = false;
 let cachedJobs = [];
-let currentProfileVersion = null;
+// Profile cache: an ordered list (for dropdowns + drawer rendering) and a
+// Map keyed by id (for O(1) version lookup in the freshness predicate).
+let cachedProfiles = [];
+let profilesById = new Map();
+let defaultProfileId = null;
 // Cached so we can show/hide the "Clean up JD" button without asking the
 // background on every detail render. Refreshed on settings save.
 let llmEnabledHasKey = false;
@@ -114,10 +118,22 @@ function matchTier(score) {
   return 'weak';
 }
 
+// The active profile for a JD = its override (job.profile_id) if set,
+// else the global default. A row is fresh iff its cached score was
+// computed against that exact profile AND that profile's version hasn't
+// been bumped since.
+function getActiveProfileId(job) {
+  return job.profile_id ?? defaultProfileId ?? null;
+}
+
 function isMatchFresh(job) {
   if (job.match_score == null) return false;
-  if (!currentProfileVersion) return false;
-  return job.match_profile_version === currentProfileVersion;
+  if (!job.match_profile_id) return false;
+  const activeId = getActiveProfileId(job);
+  if (job.match_profile_id !== activeId) return false;
+  const profile = profilesById.get(activeId);
+  if (!profile) return false;
+  return job.match_profile_version === profile.version;
 }
 
 // Follow-up tier — same pattern as matchTier(). Drives chip color.
@@ -364,7 +380,8 @@ function renderNotesBlock(job) {
 }
 
 function renderMatchChip(job) {
-  if (!currentProfileVersion) return '';
+  // No profiles ingested at all → nothing to score against.
+  if (!cachedProfiles.length) return '';
   if (job.match_score == null) {
     return `<span class="match-chip" data-tier="none" title="not yet computed">—</span>`;
   }
@@ -373,9 +390,31 @@ function renderMatchChip(job) {
   const stale = !isMatchFresh(job);
   const cls = stale ? 'match-chip stale' : 'match-chip';
   const title = stale
-    ? 'profile updated — recompute to refresh'
+    ? 'profile updated or switched — recompute to refresh'
     : 'match avg of top 10 facts';
   return `<span class="${cls}" data-tier="${tier}" title="${title}">${pct}%</span>`;
+}
+
+// Inline dropdown next to the match chip. Lets the user override which
+// resume scores this row. Empty value ("") means "use default" — clearing
+// the override so future default changes flow through.
+function renderRowProfilePicker(job) {
+  if (!cachedProfiles.length) return '';
+  const jobId = job.id ?? job.jd_id;
+  if (!jobId) return '';
+  const defaultProfile = profilesById.get(defaultProfileId);
+  const defaultLabel = defaultProfile?.short_label ?? '?';
+  const opts = [
+    `<option value="" ${job.profile_id == null ? 'selected' : ''}>${escapeHtml(defaultLabel)}</option>`,
+  ];
+  for (const p of cachedProfiles) {
+    if (p.id === defaultProfileId) continue; // default is the empty-value option
+    const sel = job.profile_id === p.id ? ' selected' : '';
+    opts.push(
+      `<option value="${escapeHtml(p.id)}"${sel}>${escapeHtml(p.short_label)}</option>`,
+    );
+  }
+  return `<select class="row-profile-picker" data-job-id="${escapeHtml(jobId)}" title="resume used to score this row">${opts.join('')}</select>`;
 }
 
 // ---------- Row / detail rendering ----------
@@ -403,6 +442,7 @@ function renderRowActions(job) {
   return `
     <div class="row-actions">
       ${picker}
+      ${renderRowProfilePicker(job)}
       ${renderMatchChip(job)}
       ${renderFollowUpChip(job)}
       ${renderRowUrlLink(job)}
@@ -571,20 +611,41 @@ function renderPipelineStrip() {
 }
 
 function refreshRecomputeBanner() {
-  if (!currentProfileVersion) {
+  if (!cachedProfiles.length) {
     recomputeBanner.hidden = true;
     return;
   }
-  const stale = cachedJobs.filter(
-    (j) => j.match_profile_version !== currentProfileVersion,
-  );
+  // A row needs recompute when (a) it was never scored (a profile now
+  // exists but the JD predates it), (b) its cached match was computed
+  // against a different profile than the one currently active for it, or
+  // (c) the active profile's version has bumped since.
+  const stale = cachedJobs.filter((j) => !isMatchFresh(j));
   if (!stale.length) {
     recomputeBanner.hidden = true;
     return;
   }
   recomputeBanner.hidden = false;
   recomputeBannerLabel.textContent =
-    `${stale.length} match score${stale.length === 1 ? '' : 's'} stale.`;
+    `${stale.length} match score${stale.length === 1 ? '' : 's'} need refresh.`;
+}
+
+async function refreshProfiles() {
+  try {
+    const resp = await send('list-profiles');
+    if (!resp?.ok) return;
+    cachedProfiles = resp.profiles ?? [];
+    profilesById = new Map(cachedProfiles.map((p) => [p.id, p]));
+    defaultProfileId = resp.default_profile_id ?? null;
+    // Toolbar dot fires when at least one profile has facts.
+    const totalFacts = cachedProfiles.reduce((s, p) => s + (p.fact_count ?? 0), 0);
+    if (totalFacts > 0) {
+      openProfileBtn.classList.add('has-dot');
+    } else {
+      openProfileBtn.classList.remove('has-dot');
+    }
+  } catch {
+    // background may be warming up — leave caches alone
+  }
 }
 
 async function refreshJobs() {
@@ -595,7 +656,9 @@ async function refreshJobs() {
     return;
   }
   cachedJobs = resp.jobs;
-  currentProfileVersion = resp.profile_version ?? null;
+  defaultProfileId = resp.default_profile_id ?? defaultProfileId;
+  // Profiles list lives behind a separate handler so list responses stay slim.
+  await refreshProfiles();
   renderPipelineStrip();
   renderJobsList();
   refreshRecomputeBanner();
@@ -607,12 +670,12 @@ function renderMatchSection() {
   const job = currentJobFull;
   if (!job) return '';
 
-  if (!currentProfileVersion) {
+  if (!cachedProfiles.length) {
     return `
       <div class="detail-section-label">Profile match</div>
       <div class="match-card">
         <div class="match-headline">
-          <span class="label">Ingest your profile to see match scores.</span>
+          <span class="label">Add a profile to see match scores.</span>
         </div>
       </div>
     `;
@@ -628,6 +691,12 @@ function renderMatchSection() {
   const subLabel = score == null
     ? 'not yet computed'
     : `avg of top ${(currentJobMatchFacts ?? job.match_facts ?? []).length} facts`;
+  const profilePickerHtml = `
+    <label class="match-profile-label" style="display:inline-flex; gap:6px; align-items:center; font-size:11px; opacity:0.75;">
+      Resume:
+      ${renderRowProfilePicker(job)}
+    </label>
+  `;
 
   let factsHtml = '';
   const facts = fresh ? currentJobMatchFacts : null;
@@ -680,6 +749,7 @@ function renderMatchSection() {
         <span class="big-score" data-tier="${tier}">${pct}</span>
         <span class="label">${escapeHtml(subLabel)}</span>
         ${staleTag}
+        ${profilePickerHtml}
       </div>
       ${factsBlock}
       <div class="match-actions">
@@ -757,7 +827,7 @@ async function showDetail(jobId) {
     currentJobId = jobId;
     currentJobFull = resp.job;
     currentJobMatchFacts = resp.hydrated_match_facts ?? null;
-    currentProfileVersion = resp.profile_version ?? currentProfileVersion;
+    if (resp.default_profile_id) defaultProfileId = resp.default_profile_id;
     currentView = 'detail';
     isEditMode = false;
     bodyViewMode = 'cleaned';
@@ -776,11 +846,11 @@ backBtn.addEventListener('click', showLibrary);
 
 // ---------- Drawers ----------
 
-function openProfile() {
+async function openProfile() {
   profileDrawer.hidden = false;
   profileBackdrop.hidden = false;
-  refreshProfileSummary();
-  refreshProfileFactsView();
+  await refreshProfiles();
+  renderProfileDrawer();
 }
 function closeProfile() {
   profileDrawer.hidden = true;
@@ -942,6 +1012,52 @@ async function handleStatusPickerChange(event) {
   }
 }
 
+// Row dropdown: change which profile scores this row. Empty string ("")
+// means "use default" — we store that as null, so future default switches
+// flow through to this row.
+async function handleRowProfilePickerChange(event) {
+  const select = event.target;
+  if (!(select instanceof HTMLSelectElement)) return;
+  if (!select.classList.contains('row-profile-picker')) return;
+  const jobId = select.dataset.jobId;
+  const value = select.value;
+  const profileId = value === '' ? null : value;
+  select.disabled = true;
+  try {
+    const resp = await send('set-job-profile', {
+      job_id: jobId,
+      profile_id: profileId,
+    });
+    if (!resp?.ok) throw new Error(resp?.error ?? 'set-job-profile failed');
+    // Update the cached row so we don't need a full list refetch.
+    const row = cachedJobs.find((j) => j.id === jobId);
+    if (row && resp.job) {
+      row.profile_id = resp.job.profile_id;
+      row.match_score = resp.job.match_score;
+      row.match_facts = resp.job.match_facts;
+      row.match_computed_at = resp.job.match_computed_at;
+      row.match_profile_version = resp.job.match_profile_version;
+      row.match_profile_id = resp.job.match_profile_id;
+    }
+    if (currentView === 'detail' && currentJobId === jobId && resp.job) {
+      currentJobFull = resp.job;
+      // Re-fetch hydrated facts for the detail view.
+      const get = await send('get', { id: jobId });
+      if (get?.ok) {
+        currentJobMatchFacts = get.hydrated_match_facts ?? null;
+      }
+      renderDetail();
+    } else {
+      renderJobsList();
+    }
+    refreshRecomputeBanner();
+  } catch (err) {
+    console.error('[row-profile] failed to update', err);
+  } finally {
+    select.disabled = false;
+  }
+}
+
 // ---------- Tag strip handlers (inline add / remove / click-to-filter) ----------
 
 function findJobById(jobId) {
@@ -1081,7 +1197,10 @@ async function handleDeleteClick(event) {
 
 // ---------- Library click delegation ----------
 
-jobsEl.addEventListener('change', handleStatusPickerChange);
+jobsEl.addEventListener('change', (event) => {
+  handleStatusPickerChange(event);
+  handleRowProfilePickerChange(event);
+});
 jobsEl.addEventListener('click', (event) => {
   const t = event.target;
   if (t.closest('.delete-btn')) return handleDeleteClick(event);
@@ -1110,7 +1229,10 @@ pipelineStrip.addEventListener('click', (event) => {
 
 // ---------- Detail click delegation ----------
 
-detailContent.addEventListener('change', handleStatusPickerChange);
+detailContent.addEventListener('change', (event) => {
+  handleStatusPickerChange(event);
+  handleRowProfilePickerChange(event);
+});
 detailContent.addEventListener('click', (event) => {
   const t = event.target;
   if (!(t instanceof HTMLElement)) return;
@@ -1245,7 +1367,7 @@ async function handleSaveClick(event) {
     if (get?.ok && get.job) {
       currentJobFull = get.job;
       currentJobMatchFacts = get.hydrated_match_facts ?? null;
-      currentProfileVersion = get.profile_version ?? currentProfileVersion;
+      if (get.default_profile_id) defaultProfileId = get.default_profile_id;
       toolbarTitle.textContent = get.job.title || '(untitled)';
     }
     isEditMode = false;
@@ -1276,7 +1398,7 @@ async function handleRecomputeMatchClick() {
     if (get?.ok && get.job) {
       currentJobFull = get.job;
       currentJobMatchFacts = get.hydrated_match_facts ?? null;
-      currentProfileVersion = get.profile_version ?? currentProfileVersion;
+      if (get.default_profile_id) defaultProfileId = get.default_profile_id;
     }
     renderDetail();
     await refreshJobs();
@@ -1344,7 +1466,6 @@ recomputeAllBtn.addEventListener('click', async () => {
   try {
     const resp = await send('recompute-all-matches');
     if (!resp?.ok) throw new Error(resp?.error ?? 'recompute failed');
-    if (resp.profile_version) currentProfileVersion = resp.profile_version;
     await refreshJobs();
   } catch (err) {
     console.error('[recompute-all] failed', err);
@@ -1366,116 +1487,6 @@ function setProgress(done, total) {
   ingestProgressFill.style.width = `${Math.min(100, (done / total) * 100)}%`;
 }
 
-async function refreshProfileSummary() {
-  try {
-    const resp = await send('profile-stats');
-    if (!resp?.ok) return;
-    currentProfileVersion = resp.profile_version ?? null;
-    if (resp.count > 0) {
-      profileSummary.textContent = `${resp.count} profile fact(s) ingested`;
-      openProfileBtn.classList.add('has-dot');
-    } else {
-      profileSummary.textContent = '(no profile yet)';
-      openProfileBtn.classList.remove('has-dot');
-    }
-  } catch {
-    // ignore — background may be warming up
-  }
-}
-
-function renderProfileMetrics(facts) {
-  if (!facts.length) return '';
-  const counts = new Map();
-  for (const f of facts) {
-    const key = f.section ?? '(no section)';
-    counts.set(key, (counts.get(key) ?? 0) + 1);
-  }
-  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  const breakdownHtml = sorted
-    .map(([name, n]) => {
-      const cls = n < 3 ? ' class="sparse" title="sparse section — retrieval risk"' : '';
-      return `<span${cls}>${escapeHtml(name)}: ${n}</span>`;
-    })
-    .join('');
-  const first = facts[0];
-  const modelLine = first.model_id
-    ? `<div class="model">${escapeHtml(first.model_id)} · ${escapeHtml(first.model_version ?? '?')}</div>`
-    : '';
-  return `
-    <div class="total">${facts.length} atomic fact${facts.length === 1 ? '' : 's'} across ${sorted.length} section${sorted.length === 1 ? '' : 's'}</div>
-    <div class="breakdown">${breakdownHtml}</div>
-    ${modelLine}
-  `;
-}
-
-function renderProfileFactsList(facts) {
-  if (!facts.length) return '';
-  const sections = new Map();
-  for (const f of facts) {
-    const sectionKey = f.section ?? '(no section)';
-    if (!sections.has(sectionKey)) sections.set(sectionKey, new Map());
-    const subKey = f.subsection ?? '__top__';
-    const sub = sections.get(sectionKey);
-    if (!sub.has(subKey)) sub.set(subKey, []);
-    sub.get(subKey).push(f);
-  }
-
-  return [...sections.entries()]
-    .map(([sectionName, subs]) => {
-      const subBlocks = [...subs.entries()]
-        .map(([subName, list]) => {
-          const factsHtml = list
-            .map((f) => `<div class="fact">${escapeHtml(f.text)}</div>`)
-            .join('');
-          if (subName === '__top__') return factsHtml;
-          return `
-            <div class="subsection-block">
-              <div class="subsection-name">${escapeHtml(subName)}</div>
-              ${factsHtml}
-            </div>
-          `;
-        })
-        .join('');
-      return `
-        <div class="section-block">
-          <div class="section-name">${escapeHtml(sectionName)}</div>
-          ${subBlocks}
-        </div>
-      `;
-    })
-    .join('');
-}
-
-async function refreshProfileFactsView() {
-  try {
-    const resp = await send('list-profile-facts');
-    if (!resp?.ok) return;
-    const facts = resp.facts ?? [];
-    if (!facts.length) {
-      profileFactsDetails.hidden = true;
-      return;
-    }
-    profileFactsDetails.hidden = false;
-    const summaryEl = profileFactsDetails.querySelector('.profile-facts-summary');
-    if (summaryEl) summaryEl.textContent = `View facts (${facts.length})`;
-    profileMetrics.innerHTML = renderProfileMetrics(facts);
-    profileFactsList.innerHTML = renderProfileFactsList(facts);
-  } catch {
-    // ignore — background may be warming up
-  }
-}
-
-profileFile.addEventListener('change', async () => {
-  const file = profileFile.files?.[0];
-  if (!file) return;
-  const text = await file.text();
-  profilePaste.value = text;
-});
-
-// ---------- Resume upload (PDF / plain text) ----------
-
-resumeUploadBtn.addEventListener('click', () => resumeFile.click());
-
 // Convert an ArrayBuffer to base64. Chunked to avoid call-stack limits on
 // large files (String.fromCharCode.apply has a per-call argument cap).
 function arrayBufferToBase64(buf) {
@@ -1488,15 +1499,103 @@ function arrayBufferToBase64(buf) {
   return btoa(binary);
 }
 
-resumeFile.addEventListener('change', async () => {
-  const file = resumeFile.files?.[0];
-  if (!file) return;
+// ---------- Multi-profile drawer ----------
+
+function renderProfileDrawer() {
+  if (!cachedProfiles.length) {
+    profileList.innerHTML = `<div class="status" style="font-size:11px; opacity:0.6;">No profiles yet — click <strong>+ Add resume</strong> to create one.</div>`;
+    return;
+  }
+  profileList.innerHTML = cachedProfiles.map(renderProfileCard).join('');
+}
+
+function renderProfileCard(profile) {
+  const isDefault = profile.is_default;
+  const cardCls = isDefault ? 'profile-card is-default' : 'profile-card';
+  const starCls = isDefault ? 'default-star-btn is-default' : 'default-star-btn';
+  const starTitle = isDefault ? 'default profile' : 'set as default';
+  const factsLine = `${profile.fact_count ?? 0} fact${profile.fact_count === 1 ? '' : 's'}`;
+  return `
+    <div class="${cardCls}" data-profile-id="${escapeHtml(profile.id)}">
+      <div class="profile-card-header">
+        <input class="profile-card-name" data-profile-id="${escapeHtml(profile.id)}"
+               value="${escapeHtml(profile.name)}" maxlength="60" />
+        <input class="profile-card-short" data-profile-id="${escapeHtml(profile.id)}"
+               value="${escapeHtml(profile.short_label)}" maxlength="6" title="short label" />
+        <button class="${starCls}" data-profile-id="${escapeHtml(profile.id)}"
+                title="${starTitle}" type="button">★</button>
+      </div>
+      <div class="profile-card-meta">${factsLine}</div>
+      <div class="profile-card-actions">
+        <input class="profile-card-resume-file" type="file"
+               data-profile-id="${escapeHtml(profile.id)}"
+               accept=".pdf,.txt,application/pdf,text/plain"
+               style="display:none;" />
+        <button class="profile-card-upload-btn" data-profile-id="${escapeHtml(profile.id)}" type="button">Upload resume</button>
+        <button class="profile-card-paste-btn" data-profile-id="${escapeHtml(profile.id)}" type="button">Paste markdown</button>
+        <button class="profile-card-delete-btn" data-profile-id="${escapeHtml(profile.id)}" type="button">Delete</button>
+      </div>
+      <div class="profile-card-paste-area" data-profile-id="${escapeHtml(profile.id)}" hidden>
+        <textarea class="profile-card-paste-text" placeholder="Paste profile.md contents (atomic facts as markdown bullets)…"></textarea>
+        <div style="display:flex; gap:6px;">
+          <button class="profile-card-paste-submit" data-profile-id="${escapeHtml(profile.id)}" type="button">Ingest markdown</button>
+          <button class="profile-card-paste-cancel" data-profile-id="${escapeHtml(profile.id)}" type="button">Cancel</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function setActionDisabled(profileId, disabled) {
+  const card = profileList.querySelector(`.profile-card[data-profile-id="${CSS.escape(profileId)}"]`);
+  if (!card) return;
+  for (const btn of card.querySelectorAll('button')) {
+    btn.disabled = disabled;
+  }
+}
+
+async function handleSetDefault(profileId) {
+  const resp = await send('set-default-profile', { id: profileId });
+  if (!resp?.ok) {
+    profileStatus.className = 'status error';
+    profileStatus.textContent = `error: ${resp?.error ?? 'unknown'}`;
+    return;
+  }
+  defaultProfileId = profileId;
+  await refreshProfiles();
+  renderProfileDrawer();
+  await refreshJobs();
+}
+
+async function handleRenameProfileField(input, field) {
+  const profileId = input.dataset.profileId;
+  if (!profileId) return;
+  const value = input.value.trim();
+  if (!value) {
+    // empty → restore from cache
+    const p = profilesById.get(profileId);
+    if (p) input.value = field === 'name' ? p.name : p.short_label;
+    return;
+  }
+  const patch = field === 'name' ? { name: value } : { short_label: value };
+  const resp = await send('rename-profile', { id: profileId, ...patch });
+  if (!resp?.ok) {
+    profileStatus.className = 'status error';
+    profileStatus.textContent = `rename failed: ${resp?.error ?? 'unknown'}`;
+    return;
+  }
+  await refreshProfiles();
+  renderProfileDrawer();
+  // Also refresh the row pickers so labels update everywhere.
+  renderJobsList();
+  if (currentView === 'detail') renderDetail();
+}
+
+async function handleProfileResumeUpload(profileId, file) {
   const name = file.name.toLowerCase();
-  resumeUploadBtn.disabled = true;
-  clearProfileBtn.disabled = true;
+  setActionDisabled(profileId, true);
   profileStatus.className = 'status';
   setProgress(0, 1);
-
   const t0 = performance.now();
   try {
     let resp;
@@ -1508,81 +1607,220 @@ resumeFile.addEventListener('change', async () => {
         kind: 'pdf',
         base64,
         filename: file.name,
+        profile_id: profileId,
       });
     } else if (name.endsWith('.txt') || file.type === 'text/plain') {
       profileStatus.textContent = 'reading text…';
       const text = await file.text();
-      resp = await send('ingest-resume', { kind: 'text', text });
+      resp = await send('ingest-resume', {
+        kind: 'text',
+        text,
+        profile_id: profileId,
+      });
     } else {
-      throw new Error(`Unsupported file type: ${file.name}. Use .pdf or .txt (or paste markdown under Advanced).`);
+      throw new Error(`Unsupported file type: ${file.name}. Use .pdf or .txt, or click Paste markdown.`);
     }
     if (!resp?.ok) throw new Error(resp?.error ?? 'ingest failed');
     const totalMs = performance.now() - t0;
-    profileStatus.textContent = `ingested ${resp.count} fact(s) · ${fmt(totalMs)}ms total${resp.dropped ? ` · ${resp.dropped} malformed dropped` : ''}`;
-    await refreshProfileSummary();
-    await refreshProfileFactsView();
+    profileStatus.textContent = `ingested ${resp.count} fact(s) · ${fmt(totalMs)}ms${resp.dropped ? ` · ${resp.dropped} malformed dropped` : ''}`;
+    await refreshProfiles();
+    renderProfileDrawer();
     await refreshJobs();
   } catch (err) {
     profileStatus.className = 'status error';
     profileStatus.textContent = `error: ${String(err?.message ?? err)}`;
   } finally {
-    resumeUploadBtn.disabled = false;
-    clearProfileBtn.disabled = false;
-    resumeFile.value = '';
+    setActionDisabled(profileId, false);
     setTimeout(() => setProgress(0, 0), 1200);
   }
-});
+}
 
-ingestProfileBtn.addEventListener('click', async () => {
-  const md = profilePaste.value.trim();
-  if (!md) {
-    profileStatus.className = 'status error';
-    profileStatus.textContent = 'paste or upload a markdown file first';
-    return;
-  }
-  ingestProfileBtn.disabled = true;
-  clearProfileBtn.disabled = true;
+async function handleProfileMarkdownIngest(profileId, markdown) {
+  setActionDisabled(profileId, true);
   profileStatus.className = 'status';
   profileStatus.textContent = 'parsing…';
   setProgress(0, 1);
   const t0 = performance.now();
   try {
-    const resp = await send('ingest-profile', { markdown: md });
+    const resp = await send('ingest-profile', {
+      markdown,
+      profile_id: profileId,
+    });
     if (!resp?.ok) throw new Error(resp?.error ?? 'ingest failed');
     const totalMs = performance.now() - t0;
-    profileStatus.textContent =
-      `ingested ${resp.count} fact(s) · ${fmt(totalMs)}ms total`;
-    profilePaste.value = '';
-    profileFile.value = '';
-    await refreshProfileSummary();
-    await refreshProfileFactsView();
+    profileStatus.textContent = `ingested ${resp.count} fact(s) · ${fmt(totalMs)}ms`;
+    await refreshProfiles();
+    renderProfileDrawer();
     await refreshJobs();
   } catch (err) {
     profileStatus.className = 'status error';
     profileStatus.textContent = `error: ${String(err?.message ?? err)}`;
   } finally {
-    ingestProfileBtn.disabled = false;
-    clearProfileBtn.disabled = false;
+    setActionDisabled(profileId, false);
     setTimeout(() => setProgress(0, 0), 1200);
+  }
+}
+
+async function handleDeleteProfile(profileId) {
+  const profile = profilesById.get(profileId);
+  if (!profile) return;
+  if (!confirm(`Delete profile "${profile.name}"? Its facts and embeddings will be removed. JD overrides pointing at it will revert to default.`)) {
+    return;
+  }
+  setActionDisabled(profileId, true);
+  try {
+    const resp = await send('delete-profile', { id: profileId });
+    if (!resp?.ok) throw new Error(resp?.error ?? 'delete failed');
+    profileStatus.className = 'status';
+    profileStatus.textContent = 'deleted';
+    await refreshProfiles();
+    renderProfileDrawer();
+    await refreshJobs();
+  } catch (err) {
+    profileStatus.className = 'status error';
+    profileStatus.textContent = `error: ${String(err?.message ?? err)}`;
+    setActionDisabled(profileId, false);
+  }
+}
+
+// Drawer click delegation — handles all the per-card buttons.
+profileList.addEventListener('click', async (event) => {
+  const t = event.target;
+  if (!(t instanceof HTMLElement)) return;
+  const profileId = t.dataset.profileId;
+  if (!profileId) return;
+
+  if (t.classList.contains('default-star-btn')) {
+    if (!t.classList.contains('is-default')) {
+      await handleSetDefault(profileId);
+    }
+    return;
+  }
+
+  if (t.classList.contains('profile-card-upload-btn')) {
+    const fileInput = profileList.querySelector(
+      `.profile-card-resume-file[data-profile-id="${CSS.escape(profileId)}"]`,
+    );
+    if (fileInput) fileInput.click();
+    return;
+  }
+
+  if (t.classList.contains('profile-card-paste-btn')) {
+    const area = profileList.querySelector(
+      `.profile-card-paste-area[data-profile-id="${CSS.escape(profileId)}"]`,
+    );
+    if (area) area.hidden = false;
+    return;
+  }
+
+  if (t.classList.contains('profile-card-paste-cancel')) {
+    const area = profileList.querySelector(
+      `.profile-card-paste-area[data-profile-id="${CSS.escape(profileId)}"]`,
+    );
+    if (area) {
+      area.hidden = true;
+      const ta = area.querySelector('.profile-card-paste-text');
+      if (ta) ta.value = '';
+    }
+    return;
+  }
+
+  if (t.classList.contains('profile-card-paste-submit')) {
+    const area = profileList.querySelector(
+      `.profile-card-paste-area[data-profile-id="${CSS.escape(profileId)}"]`,
+    );
+    const ta = area?.querySelector('.profile-card-paste-text');
+    const md = ta?.value?.trim() ?? '';
+    if (!md) {
+      profileStatus.className = 'status error';
+      profileStatus.textContent = 'paste markdown first';
+      return;
+    }
+    await handleProfileMarkdownIngest(profileId, md);
+    return;
+  }
+
+  if (t.classList.contains('profile-card-delete-btn')) {
+    await handleDeleteProfile(profileId);
+    return;
   }
 });
 
-clearProfileBtn.addEventListener('click', async () => {
-  if (!confirm('Clear all profile facts? This cannot be undone.')) return;
-  clearProfileBtn.disabled = true;
+// File-input change for the per-card resume upload.
+profileList.addEventListener('change', async (event) => {
+  const input = event.target;
+  if (!(input instanceof HTMLInputElement)) return;
+  if (input.classList.contains('profile-card-resume-file')) {
+    const profileId = input.dataset.profileId;
+    const file = input.files?.[0];
+    input.value = '';
+    if (profileId && file) await handleProfileResumeUpload(profileId, file);
+  }
+});
+
+// Inline rename: commit on blur or Enter.
+profileList.addEventListener('blur', (event) => {
+  const t = event.target;
+  if (!(t instanceof HTMLInputElement)) return;
+  if (t.classList.contains('profile-card-name')) {
+    handleRenameProfileField(t, 'name');
+  } else if (t.classList.contains('profile-card-short')) {
+    handleRenameProfileField(t, 'short_label');
+  }
+}, true);
+profileList.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter') return;
+  const t = event.target;
+  if (!(t instanceof HTMLInputElement)) return;
+  if (t.classList.contains('profile-card-name') || t.classList.contains('profile-card-short')) {
+    event.preventDefault();
+    t.blur();
+  }
+});
+
+// ---------- Add-profile modal ----------
+
+function openAddProfile() {
+  newProfileName.value = '';
+  newProfileShort.value = '';
+  newProfileStatus.className = 'status';
+  newProfileStatus.textContent = '';
+  addProfileOverlay.hidden = false;
+  newProfileName.focus();
+}
+function closeAddProfile() {
+  addProfileOverlay.hidden = true;
+}
+
+addProfileBtn.addEventListener('click', openAddProfile);
+newProfileCancel.addEventListener('click', closeAddProfile);
+addProfileOverlay.addEventListener('click', (event) => {
+  if (event.target === addProfileOverlay) closeAddProfile();
+});
+newProfileCreate.addEventListener('click', async () => {
+  const name = newProfileName.value.trim();
+  if (!name) {
+    newProfileStatus.className = 'status error';
+    newProfileStatus.textContent = 'name is required';
+    return;
+  }
+  const short = newProfileShort.value.trim().slice(0, 6);
+  newProfileCreate.disabled = true;
   try {
-    const resp = await send('clear-profile');
-    if (!resp?.ok) throw new Error(resp?.error ?? 'clear failed');
-    profileStatus.className = 'status';
-    profileStatus.textContent = 'cleared';
-    await refreshProfileSummary();
-    await refreshProfileFactsView();
+    const resp = await send('create-profile', {
+      name,
+      short_label: short || undefined,
+    });
+    if (!resp?.ok) throw new Error(resp?.error ?? 'create failed');
+    closeAddProfile();
+    await refreshProfiles();
+    renderProfileDrawer();
     await refreshJobs();
   } catch (err) {
-    profileStatus.className = 'status error';
-    profileStatus.textContent = `error: ${String(err?.message ?? err)}`;
+    newProfileStatus.className = 'status error';
+    newProfileStatus.textContent = `error: ${String(err?.message ?? err)}`;
   } finally {
-    clearProfileBtn.disabled = false;
+    newProfileCreate.disabled = false;
   }
 });
 
@@ -1703,8 +1941,11 @@ chrome.runtime.onMessage.addListener((msg) => {
     profileStatus.textContent = `embedding ${msg.done} / ${msg.total}…`;
     setProgress(msg.done, msg.total);
   } else if (msg.type === 'match-stale') {
-    currentProfileVersion = msg.profile_version ?? null;
-    refreshJobs();
+    // A profile changed (re-ingest, default switch, deletion). Refresh both
+    // profile cache and jobs — staleness is per-(jd, profile) now.
+    refreshJobs().then(() => {
+      if (!profileDrawer.hidden) renderProfileDrawer();
+    });
   } else if (msg.type === 'recompute-progress') {
     // Optional: surface in the recompute banner. For now, just leave it
     // silent — the final refreshJobs() after the call resolves updates UI.
@@ -1715,6 +1956,5 @@ chrome.runtime.onMessage.addListener((msg) => {
 // ---------- Init ----------
 
 populateSortDropdown();
-refreshProfileSummary();
 refreshSettingsDrawer();
 refreshJobs();

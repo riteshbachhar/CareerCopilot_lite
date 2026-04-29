@@ -747,6 +747,149 @@
         border-left: 2px solid var(--line);
         margin-left: 4px;
       }
+
+      /* ---------- Profile cards (multi-resume) ---------- */
+      #profile-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      .profile-card {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 8px 10px;
+        font-size: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .profile-card.is-default { border-color: var(--accent); }
+      .profile-card-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .profile-card-name {
+        flex: 1 1 auto;
+        min-width: 100px;
+        font-weight: 600;
+        background: transparent;
+        border: 1px solid transparent;
+        color: inherit;
+        font-family: inherit;
+        font-size: 12px;
+        padding: 2px 4px;
+        border-radius: 3px;
+      }
+      .profile-card-name:hover, .profile-card-name:focus {
+        border-color: var(--line);
+        background: rgba(0, 0, 0, 0.02);
+      }
+      .profile-card-short {
+        background: rgba(59, 130, 246, 0.12);
+        color: var(--accent);
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        font-size: 10px;
+        padding: 1px 6px;
+        border-radius: 3px;
+        border: 1px solid rgba(59, 130, 246, 0.3);
+        max-width: 60px;
+        text-align: center;
+      }
+      .profile-card-short:hover, .profile-card-short:focus {
+        outline: 1px solid var(--accent);
+      }
+      .default-star-btn {
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        font-size: 14px;
+        line-height: 1;
+        padding: 0 4px;
+        opacity: 0.4;
+      }
+      .default-star-btn.is-default { opacity: 1; color: #f5b50a; }
+      .profile-card-meta {
+        font-size: 11px;
+        opacity: 0.7;
+      }
+      .profile-card-actions {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .profile-card-actions button {
+        font-size: 11px;
+        padding: 2px 8px;
+      }
+      .profile-card-paste-area {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 4px;
+      }
+      .profile-card-paste-area textarea {
+        min-height: 100px;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        font-size: 11px;
+      }
+      .profile-card-facts {
+        font-size: 11px;
+      }
+
+      /* ---------- Row profile picker (next to match chip) ---------- */
+      .row-profile-picker {
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        font-size: 10px;
+        padding: 1px 4px;
+        border-radius: 3px;
+        border: 1px solid var(--line);
+        background: transparent;
+        color: var(--accent);
+        cursor: pointer;
+        max-width: 70px;
+      }
+      .row-profile-picker:hover { border-color: var(--accent); }
+      .row-profile-picker:disabled { opacity: 0.5; cursor: default; }
+
+      /* ---------- Modal overlay (used for Add resume) ---------- */
+      .modal-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.4);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+      }
+      .modal-card {
+        background: Canvas;
+        color: CanvasText;
+        border: 1px solid var(--line-strong);
+        border-radius: 6px;
+        padding: 16px;
+        width: min(320px, 90%);
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+      }
+      .modal-card h3 { margin: 0; font-size: 13px; }
+      .modal-field {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        font-size: 11px;
+      }
+      .modal-field .hint { opacity: 0.55; font-weight: normal; }
+      .modal-field input { font-size: 12px; padding: 4px 6px; }
+      .modal-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
     </style>
   </head>
   <body>
@@ -860,51 +1003,54 @@
     <div id="profile-backdrop" class="drawer-backdrop" hidden></div>
     <div id="profile-drawer" class="drawer" hidden>
       <div class="drawer-header">
-        <h2>Profile</h2>
+        <h2>Profiles</h2>
         <button id="close-profile" class="icon-btn" title="close">✕</button>
       </div>
-      <div id="profile-summary" class="drawer-summary">(no profile yet)</div>
-
       <div class="drawer-summary" style="font-size: 11px; opacity: 0.75;">
-        Upload your resume (PDF or plain-text). The LLM extracts atomic facts (Experience bullets, Skills, Education) into the same structured form the match scoring needs. Requires an LLM key — configure in Settings ⚙.
+        One default profile scores every captured JD. Add more (e.g. ML, RSE) and use the row dropdown next to a match chip to override per-job.
       </div>
 
-      <input id="resume-file" type="file" accept=".pdf,.txt,application/pdf,text/plain" style="display:none;" />
-      <button id="resume-upload-btn" class="primary">Upload resume</button>
-      <div style="display:flex; gap:8px; align-items:center;">
-        <button id="clear-profile" class="dashed">Clear profile</button>
-        <span id="profile-status" class="status"></span>
-      </div>
+      <button id="add-profile-btn" class="primary">+ Add resume</button>
       <div id="ingest-progress" class="progress" hidden>
         <div id="ingest-progress-fill" class="progress-fill"></div>
       </div>
+      <div id="profile-status" class="status"></div>
 
-      <details id="advanced-profile-details">
-        <summary class="profile-facts-summary">Advanced: paste markdown directly</summary>
-        <div style="margin-top: 8px; display: flex; flex-direction: column; gap: 8px;">
-          <input id="profile-file" type="file" accept=".md,text/markdown,text/plain" style="font-size:11px;" />
-          <textarea id="profile-paste" placeholder="…or paste profile.md contents here" style="min-height:160px; font-family: ui-monospace, SF Mono, Menlo, monospace; font-size: 11px;"></textarea>
-          <div style="display:flex; gap:8px; align-items:center;">
-            <button id="ingest-profile">Ingest markdown</button>
-          </div>
+      <div id="profile-list"></div>
+
+      <hr style="border: 0; border-top: 1px solid var(--line); margin: 12px 0;">
+
+      <details>
+        <summary class="profile-facts-summary">Export jobs</summary>
+        <div style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 11px;">
+          <button id="export-csv">CSV</button>
+          <button id="export-json">JSON</button>
+          <label style="display: inline-flex; align-items: center; gap: 4px; opacity: 0.75;">
+            <input id="export-redact" type="checkbox" />
+            redact JD body
+          </label>
+          <span id="export-status" class="status"></span>
         </div>
       </details>
+    </div>
 
-      <details id="profile-facts-details" hidden>
-        <summary class="profile-facts-summary">View facts</summary>
-        <div id="profile-metrics" class="profile-metrics"></div>
-        <div id="profile-facts-list" class="profile-facts-list"></div>
-      </details>
-
-      <div class="profile-facts-summary" style="cursor: default;">Export jobs</div>
-      <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 11px;">
-        <button id="export-csv">CSV</button>
-        <button id="export-json">JSON</button>
-        <label style="display: inline-flex; align-items: center; gap: 4px; opacity: 0.75;">
-          <input id="export-redact" type="checkbox" />
-          redact JD body
+    <!-- ==================== Add profile modal ==================== -->
+    <div id="add-profile-overlay" class="modal-overlay" hidden>
+      <div class="modal-card" role="dialog" aria-labelledby="add-profile-title">
+        <h3 id="add-profile-title">Add resume</h3>
+        <label class="modal-field">
+          <span>Name</span>
+          <input id="new-profile-name" type="text" placeholder="ML Engineer" maxlength="60" />
         </label>
-        <span id="export-status" class="status"></span>
+        <label class="modal-field">
+          <span>Short label <span class="hint">(≤6 chars, shown in row dropdown)</span></span>
+          <input id="new-profile-short" type="text" placeholder="ML" maxlength="6" />
+        </label>
+        <div id="new-profile-status" class="status"></div>
+        <div class="modal-actions">
+          <button id="new-profile-cancel" type="button">Cancel</button>
+          <button id="new-profile-create" class="primary" type="button">Create</button>
+        </div>
       </div>
     </div>
 

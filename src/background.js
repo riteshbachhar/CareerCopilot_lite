@@ -14,9 +14,14 @@ import {
   listProfileFacts,
   clearProfile,
   getProfileFact,
-  getProfileVersion,
+  addProfile,
+  getProfile,
+  listProfilesWithCounts,
+  renameProfile,
   setProfileVersion,
-  clearProfileVersion,
+  deleteProfileCascade,
+  getDefaultProfileId,
+  setDefaultProfileId,
 } from './db.js';
 import { extractJobPostingFromPage } from './adapters/json-ld.js';
 import { parseProfileMarkdown } from './profile/parse-markdown.js';
@@ -119,11 +124,13 @@ function notifyIngestStage(stage) {
 }
 
 // Shared per-fact ingest loop. Used by both ingest-profile (markdown facts)
-// and ingest-resume (LLM-extracted facts). Wipes the profile, embeds every
-// fact, stores it, pings progress per fact, then bumps profile_version and
-// fires match-stale so the side panel can mark existing matches as stale.
-async function ingestFactList(facts) {
-  await clearProfile();
+// and ingest-resume (LLM-extracted facts). Wipes the named profile only,
+// embeds every fact, stores it scoped to that profile, pings progress per
+// fact, then bumps that profile's version and fires match-stale so the side
+// panel can mark affected matches as stale.
+async function ingestFactList(facts, profileId) {
+  if (!profileId) throw new Error('ingestFactList: profileId required');
+  await clearProfile(profileId);
   const total = facts.length;
   let done = 0;
   for (const fact of facts) {
@@ -131,6 +138,7 @@ async function ingestFactList(facts) {
     const embedInput = [breadcrumb, fact.text].filter(Boolean).join('\n');
     const { vector, dims, modelId, modelVersion } = await embedViaOffscreen(embedInput);
     const row = await addProfileFact({
+      profile_id: profileId,
       section: fact.section,
       subsection: fact.subsection,
       text: fact.text,
@@ -138,38 +146,63 @@ async function ingestFactList(facts) {
       model_id: modelId,
       model_version: modelVersion,
     });
-    await putProfileEmbedding({ fact_id: row.id, vector, dims });
+    await putProfileEmbedding({ fact_id: row.id, profile_id: profileId, vector, dims });
     done += 1;
     chrome.runtime
       .sendMessage({ target: 'sidepanel', type: 'ingest-progress', done, total })
       .catch(() => {});
   }
   const newVersion = String(Date.now());
-  await setProfileVersion(newVersion);
+  await setProfileVersion(profileId, newVersion);
   chrome.runtime
-    .sendMessage({ target: 'sidepanel', type: 'match-stale', profile_version: newVersion })
+    .sendMessage({
+      target: 'sidepanel',
+      type: 'match-stale',
+      profile_id: profileId,
+      profile_version: newVersion,
+    })
     .catch(() => {});
-  return { count: done, profile_version: newVersion };
+  return { count: done, profile_id: profileId, profile_version: newVersion };
+}
+
+// Resolve which profile this JD's match should be scored against.
+// override > default > none.
+async function resolveActiveProfileId(jobOrId) {
+  const job = typeof jobOrId === 'string' ? await getJob(jobOrId) : jobOrId;
+  if (job?.profile_id) return job.profile_id;
+  return getDefaultProfileId();
 }
 
 // Compute and persist a match score for a JD. Reads the existing JD vector
-// (cheap) instead of re-embedding. No-op when no profile is ingested.
-async function computeAndPersistMatch(jdId, jdVector) {
-  const profileVersion = await getProfileVersion();
-  if (!profileVersion) return null;
+// (cheap) instead of re-embedding. No-op when no profile exists at all.
+// Writes match_profile_id alongside score / facts / version so freshness
+// can be detected across profile-version bumps AND profile switches.
+async function computeAndPersistMatch(jdId, jdVector, profileIdOverride) {
+  const job = await getJob(jdId);
+  if (!job) return null;
+  const profileId = profileIdOverride ?? (await resolveActiveProfileId(job));
+  if (!profileId) return null; // no profiles exist yet
+  const profile = await getProfile(profileId);
+  if (!profile) return null; // dangling pointer, treat as no-op
   const vec =
     jdVector ??
     (await getEmbedding(jdId))?.vector ??
     null;
   if (!vec) return null;
-  const { score, top_facts } = await computeMatch(vec);
+  const { score, top_facts } = await computeMatch(vec, { profileId });
   await updateJob(jdId, {
     match_score: score,
     match_facts: top_facts,
     match_computed_at: Date.now(),
-    match_profile_version: profileVersion,
+    match_profile_version: profile.version,
+    match_profile_id: profileId,
   });
-  return { score, top_facts, profile_version: profileVersion };
+  return {
+    score,
+    top_facts,
+    profile_id: profileId,
+    profile_version: profile.version,
+  };
 }
 
 async function persistCapture({
@@ -301,7 +334,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     (async () => {
       try {
         const jobs = await listJobs();
-        const profileVersion = await getProfileVersion();
+        const defaultProfileId = await getDefaultProfileId();
         const slim = jobs.map(({ raw_text, oneliner, match_facts, ...rest }) => ({
           ...rest,
           // Prefer the LLM oneliner from cleanup; fall back to a raw_text
@@ -310,7 +343,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             (typeof oneliner === 'string' && oneliner.trim()) ||
             raw_text.slice(0, 200),
         }));
-        sendResponse({ ok: true, jobs: slim, profile_version: profileVersion });
+        sendResponse({ ok: true, jobs: slim, default_profile_id: defaultProfileId });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });
       }
@@ -322,7 +355,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     (async () => {
       try {
         const row = await getJob(msg.id);
-        const profileVersion = await getProfileVersion();
+        const defaultProfileId = await getDefaultProfileId();
         let hydrated_match_facts = null;
         if (row?.match_facts?.length) {
           hydrated_match_facts = await Promise.all(
@@ -342,7 +375,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           ok: true,
           job: row ?? null,
           hydrated_match_facts,
-          profile_version: profileVersion,
+          default_profile_id: defaultProfileId,
         });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });
@@ -460,10 +493,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'ingest-profile') {
     (async () => {
       try {
+        const profileId = msg.profile_id;
+        if (!profileId) throw new Error('ingest-profile: profile_id required');
+        const profile = await getProfile(profileId);
+        if (!profile) throw new Error(`profile not found: ${profileId}`);
         const markdown = String(msg.markdown ?? '');
         const facts = parseProfileMarkdown(markdown);
         if (facts.length === 0) throw new Error('no facts parsed from markdown');
-        const result = await ingestFactList(facts);
+        const result = await ingestFactList(facts, profileId);
         sendResponse({ ok: true, ...result });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });
@@ -475,6 +512,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'ingest-resume') {
     (async () => {
       try {
+        const profileId = msg.profile_id;
+        if (!profileId) throw new Error('ingest-resume: profile_id required');
+        const profile = await getProfile(profileId);
+        if (!profile) throw new Error(`profile not found: ${profileId}`);
         const settings = await getLlmSettings();
         if (!settings.apiKey || !settings.enabled) {
           throw new Error('Resume upload requires the LLM. Add a key in Settings ⚙ and enable it, or use the Advanced markdown paste path.');
@@ -529,7 +570,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         // Stage 4: existing per-fact embed-and-store loop. Adds order based
         // on array position so retrieval ordering matches the resume layout.
         const factsWithOrder = valid.map((f, i) => ({ ...f, order: i }));
-        const result = await ingestFactList(factsWithOrder);
+        const result = await ingestFactList(factsWithOrder, profileId);
         sendResponse({
           ok: true,
           ...result,
@@ -546,9 +587,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'profile-stats') {
     (async () => {
       try {
+        // Total fact count across all profiles. The toolbar dot fires when
+        // count > 0, so this aggregate is what it needs.
         const count = await countProfileFacts();
-        const profileVersion = await getProfileVersion();
-        sendResponse({ ok: true, count, profile_version: profileVersion });
+        sendResponse({ ok: true, count });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });
       }
@@ -559,7 +601,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'list-profile-facts') {
     (async () => {
       try {
-        const facts = await listProfileFacts();
+        const profileId = msg.profile_id;
+        if (!profileId) throw new Error('list-profile-facts: profile_id required');
+        const facts = await listProfileFacts(profileId);
         sendResponse({ ok: true, facts });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });
@@ -571,16 +615,21 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'clear-profile') {
     (async () => {
       try {
-        await clearProfile();
-        await clearProfileVersion();
+        const profileId = msg.profile_id;
+        if (!profileId) throw new Error('clear-profile: profile_id required');
+        await clearProfile(profileId);
+        // Bump version so any cached match against this profile is now stale.
+        const newVersion = String(Date.now());
+        await setProfileVersion(profileId, newVersion);
         chrome.runtime
           .sendMessage({
             target: 'sidepanel',
             type: 'match-stale',
-            profile_version: null,
+            profile_id: profileId,
+            profile_version: newVersion,
           })
           .catch(() => {});
-        sendResponse({ ok: true });
+        sendResponse({ ok: true, profile_id: profileId, profile_version: newVersion });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });
       }
@@ -596,7 +645,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         if (!row) throw new Error(`job not found: ${id}`);
         const result = await computeAndPersistMatch(id);
         if (!result) {
-          sendResponse({ ok: true, score: null, profile_version: null });
+          sendResponse({ ok: true, score: null });
           return;
         }
         sendResponse({ ok: true, ...result });
@@ -610,15 +659,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'recompute-all-matches') {
     (async () => {
       try {
-        const profileVersion = await getProfileVersion();
-        if (!profileVersion) {
-          sendResponse({ ok: true, updated: 0, profile_version: null });
+        const defaultId = await getDefaultProfileId();
+        if (!defaultId) {
+          sendResponse({ ok: true, updated: 0 });
           return;
         }
+        // Cache profile versions so the freshness check is one read.
+        const profilesList = await listProfilesWithCounts();
+        const versionById = new Map(profilesList.map((p) => [p.id, p.version]));
+
         const jobs = await listJobs();
-        const stale = jobs.filter(
-          (j) => j.match_profile_version !== profileVersion,
-        );
+        const stale = jobs.filter((j) => {
+          const activeId = j.profile_id ?? defaultId;
+          if (j.match_profile_id !== activeId) return true;
+          const expectedVersion = versionById.get(activeId);
+          return j.match_profile_version !== expectedVersion;
+        });
         let done = 0;
         for (const j of stale) {
           await computeAndPersistMatch(j.id);
@@ -632,12 +688,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             })
             .catch(() => {});
         }
-        sendResponse({
-          ok: true,
-          updated: done,
-          total: stale.length,
-          profile_version: profileVersion,
-        });
+        sendResponse({ ok: true, updated: done, total: stale.length });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });
       }
@@ -706,6 +757,150 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const settings = await getLlmSettings();
         const result = await testGroqConnection(settings);
         sendResponse({ ok: true, result });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  // ---------- Profile management ----------
+
+  if (msg.type === 'list-profiles') {
+    (async () => {
+      try {
+        const profiles = await listProfilesWithCounts();
+        const defaultProfileId = await getDefaultProfileId();
+        sendResponse({ ok: true, profiles, default_profile_id: defaultProfileId });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'create-profile') {
+    (async () => {
+      try {
+        const profile = await addProfile({
+          name: msg.name,
+          short_label: msg.short_label,
+        });
+        // First profile created → automatically becomes default.
+        const existingDefault = await getDefaultProfileId();
+        if (!existingDefault) {
+          await setDefaultProfileId(profile.id);
+        }
+        sendResponse({ ok: true, profile });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'rename-profile') {
+    (async () => {
+      try {
+        const { id, name, short_label } = msg;
+        if (!id) throw new Error('rename-profile: id required');
+        const next = await renameProfile(id, { name, short_label });
+        sendResponse({ ok: true, profile: next });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'delete-profile') {
+    (async () => {
+      try {
+        const { id } = msg;
+        if (!id) throw new Error('delete-profile: id required');
+        const profiles = await listProfilesWithCounts();
+        if (profiles.length <= 1) {
+          throw new Error('Cannot delete the last profile. Add another profile first, or use Clear contents.');
+        }
+        const isDefault = profiles.find((p) => p.id === id)?.is_default;
+        // Cascade-delete profile + facts + embeddings + clears default ptr if needed.
+        await deleteProfileCascade(id);
+        // If we deleted the default, promote the most recently created remaining profile.
+        if (isDefault) {
+          const remaining = profiles.filter((p) => p.id !== id);
+          const newDefault = remaining[remaining.length - 1] ?? remaining[0];
+          if (newDefault) await setDefaultProfileId(newDefault.id);
+        }
+        // Revert any per-JD overrides pointing at the deleted profile.
+        const jobs = await listJobs();
+        for (const j of jobs) {
+          if (j.profile_id === id) {
+            await updateJob(j.id, { profile_id: null });
+          }
+        }
+        // Fire match-stale so the side panel re-evaluates affected rows.
+        chrome.runtime
+          .sendMessage({
+            target: 'sidepanel',
+            type: 'match-stale',
+            profile_id: id,
+            profile_version: null,
+          })
+          .catch(() => {});
+        sendResponse({ ok: true });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'set-default-profile') {
+    (async () => {
+      try {
+        const { id } = msg;
+        if (!id) throw new Error('set-default-profile: id required');
+        const profile = await getProfile(id);
+        if (!profile) throw new Error(`profile not found: ${id}`);
+        await setDefaultProfileId(id);
+        // Default change can stale every JD without an override.
+        chrome.runtime
+          .sendMessage({
+            target: 'sidepanel',
+            type: 'match-stale',
+            profile_id: null,
+            profile_version: null,
+          })
+          .catch(() => {});
+        sendResponse({ ok: true, default_profile_id: id });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message ?? err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'set-job-profile') {
+    (async () => {
+      try {
+        const { job_id, profile_id } = msg;
+        if (!job_id) throw new Error('set-job-profile: job_id required');
+        const existing = await getJob(job_id);
+        if (!existing) throw new Error(`job not found: ${job_id}`);
+        // Validate the override (null is fine, means "use default").
+        if (profile_id) {
+          const p = await getProfile(profile_id);
+          if (!p) throw new Error(`profile not found: ${profile_id}`);
+        }
+        await updateJob(job_id, { profile_id: profile_id ?? null });
+        const result = await computeAndPersistMatch(job_id);
+        const next = await getJob(job_id);
+        sendResponse({
+          ok: true,
+          job: next,
+          score: result?.score ?? null,
+          profile_id: result?.profile_id ?? null,
+        });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message ?? err) });
       }
