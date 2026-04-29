@@ -8,7 +8,7 @@ Capture a job posting from any tab, embed it locally, and score it against your 
 
 - **Capture** any job page via the toolbar icon — generic JSON-LD extractor with Readability + DOM-text fallbacks. Works on Greenhouse, Lever, Ashby, Workable, Interfolio, and most branded ATSes.
 - **Track** captured jobs with status (interested / applied / interviewing / offer / rejected / archived), filters, tags, notes, and follow-up dates.
-- **Match** each JD against your ingested profile using local sentence embeddings (`all-MiniLM-L6-v2`, 384-dim, runs in-browser via ONNX Runtime Web). Score is the mean cosine of the top-10 matched facts; surfaces as a colored chip on each row plus a full breakdown in detail view.
+- **Match** each JD against your ingested profile using local sentence embeddings (`all-MiniLM-L6-v2`, 384-dim, runs in-browser via ONNX Runtime Web). The JD is split into atomic requirement-shaped chunks and each chunk is scored against the profile; the score is the mean of per-chunk best matches. Detail view groups by JD chunk into Strong matches and Gaps so you can see what the profile covers and what it doesn't.
 - **Enhance** (optional, BYOK): one click runs the captured `raw_text` through Groq, gets back a cleaned markdown version of the body plus a short factual one-liner used as the row preview. The original `raw_text` is preserved alongside the cleaned text — both are viewable.
 
 ## Tech stack
@@ -39,7 +39,7 @@ After rebuilds, click the reload icon on the extension's card.
 
 ## Quick smoke test
 
-1. Open the side panel, then the **Profile** drawer (the person icon). Paste a markdown profile or upload a resume PDF / text file. The progress bar fills as facts are embedded.
+1. Open the side panel, then the **Profile** drawer (the person icon). Paste a markdown profile (see [`atomic_facts.md`](atomic_facts.md) for the format) or upload a resume PDF / text file. The progress bar fills as facts are embedded.
 2. Navigate to any job posting (try Greenhouse, Lever, Ashby, or a branded careers page) and click **Capture current tab**.
 3. The captured row should appear with a title, a colored match-score chip, and a status picker. Click it for the detail view.
 4. Optional: click **Clean up JD** to run the LLM enhancement (requires a Groq key in Settings). The row preview switches to the LLM-generated one-liner.
@@ -49,12 +49,15 @@ After rebuilds, click the reload icon on the extension's card.
 ```
 manifest.json          MV3 manifest
 build.mjs              esbuild + static-file copy
+atomic_facts.md        Sample profile demonstrating the markdown format
 src/
   background.js        Service worker — owns IndexedDB, message routing, capture pipeline
   offscreen.js         Long-lived DOM context — hosts transformers.js + pdf.js
   embed.js             Embedding pipeline (loaded by offscreen)
   sidepanel.html|js    UI — talks only to the background SW
-  match.js             Profile match scoring (mean top-K cosine)
+  match.js             Simple top-K-mean baseline (locked, kept for reference)
+  match-coverage.js    Active scorer: JD-chunk asymmetric coverage
+  chunk-jd.js          Splits a JD into atomic requirement-shaped chunks
   db.js                IndexedDB wrapper
   constants.js         Model ID, embedding dims, status enums
   adapters/
