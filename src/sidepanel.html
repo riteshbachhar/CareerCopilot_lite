@@ -361,6 +361,79 @@
       .detail-body.cleaned li { margin: 2px 0; }
       .detail-body.cleaned p { margin: 6px 0; }
 
+      /* ---------- User tags (row + detail) ---------- */
+      .tag-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        font-size: 11px;
+        margin-top: 2px;
+      }
+      .tag-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0;
+        padding: 1px 0 1px 6px;
+        border-radius: 10px;
+        border: 1px solid rgba(59, 130, 246, 0.4);
+        background: rgba(59, 130, 246, 0.08);
+        color: var(--accent);
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        font-size: 10px;
+        line-height: 1.4;
+        cursor: pointer;
+      }
+      .tag-chip:hover { background: rgba(59, 130, 246, 0.18); }
+      .tag-chip::before { content: '#'; opacity: 0.55; margin-right: 1px; }
+      .tag-chip-remove {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 14px;
+        height: 14px;
+        margin-left: 4px;
+        margin-right: 2px;
+        border-radius: 50%;
+        opacity: 0.55;
+        font-size: 12px;
+        line-height: 1;
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        color: inherit;
+        font-family: inherit;
+      }
+      .tag-chip-remove:hover {
+        opacity: 1;
+        background: rgba(204, 51, 51, 0.18);
+        color: var(--error);
+      }
+      .tag-add-btn {
+        padding: 1px 8px;
+        border-radius: 10px;
+        border: 1px dashed var(--line-strong);
+        background: transparent;
+        color: inherit;
+        opacity: 0.55;
+        font-size: 10px;
+        line-height: 1.4;
+        cursor: pointer;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+      }
+      .tag-add-btn:hover { opacity: 1; border-color: var(--accent); color: var(--accent); }
+      .tag-input {
+        padding: 1px 6px;
+        border-radius: 10px;
+        border: 1px solid var(--accent);
+        background: transparent;
+        color: inherit;
+        font-size: 10px;
+        line-height: 1.4;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        width: 100px;
+        outline: none;
+      }
+
       /* ---------- Notes (detail) ---------- */
       .notes-block {
         white-space: pre-wrap;
@@ -401,10 +474,9 @@
       .row .preview {
         font-size: 11px;
         opacity: 0.85;
-        white-space: pre-wrap;
-        word-break: break-word;
-        max-height: 36px;
+        white-space: nowrap;
         overflow: hidden;
+        text-overflow: ellipsis;
       }
 
       /* ---------- Detail ---------- */

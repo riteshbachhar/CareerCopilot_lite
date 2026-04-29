@@ -340,6 +340,20 @@ function renderJobBody(job) {
   return `${toggle}${bodyHtml}`;
 }
 
+function renderTagStrip(job) {
+  const tags = Array.isArray(job.tags) ? job.tags : [];
+  const jobId = escapeHtml(job.id ?? job.jd_id ?? '');
+  const chipsHtml = tags
+    .map((t) => `
+      <span class="tag-chip" data-job-id="${jobId}" data-tag="${escapeHtml(t)}" title="filter by tag">
+        ${escapeHtml(t)}<button class="tag-chip-remove" data-job-id="${jobId}" data-tag="${escapeHtml(t)}" type="button" aria-label="remove tag" title="remove tag">×</button>
+      </span>
+    `)
+    .join('');
+  const addBtn = `<button class="tag-add-btn" data-job-id="${jobId}" type="button" title="add tag">+ tag</button>`;
+  return `<div class="tag-strip" data-job-id="${jobId}">${chipsHtml}${addBtn}</div>`;
+}
+
 function renderNotesBlock(job) {
   const notes = (job.notes ?? '').trim();
   if (!notes) return '';
@@ -414,6 +428,9 @@ function renderEditForm(job) {
       <label>Follow up on
         <input class="edit-follow-up" type="date" value="${escapeHtml(followUpValue)}" />
       </label>
+      <label>Tags (comma-separated)
+        <input class="edit-tags" type="text" value="${escapeHtml(Array.isArray(job.tags) ? job.tags.join(', ') : '')}" placeholder="remote, dream, priority" />
+      </label>
       <label>Notes
         <textarea class="edit-notes" placeholder="Recruiter name, salary range, prep notes…" style="min-height: 80px; font-family: inherit;">${escapeHtml(job.notes ?? '')}</textarea>
       </label>
@@ -441,6 +458,7 @@ function renderRow(job) {
       <div class="title">${escapeHtml(job.title ?? '(untitled)')}</div>
       <div class="meta">${escapeHtml(job.company ?? '')}${job.company ? ' · ' : ''}${escapeHtml(date)}</div>
       ${tags ? `<div class="meta">${escapeHtml(tags)}</div>` : ''}
+      ${renderTagStrip(job)}
       <div class="preview">${escapeHtml(job.preview ?? '')}</div>
       ${renderRowActions(job)}
     </div>
@@ -501,6 +519,7 @@ function renderJobsList() {
         j.structured_fields?.location,
         j.structured_fields?.seniority,
         j.structured_fields?.source,
+        Array.isArray(j.tags) ? j.tags.join(' ') : '',
       ]
         .filter(Boolean)
         .join(' ')
@@ -707,6 +726,7 @@ function renderDetail() {
         ${renderDeleteBtn(job)}
       </div>
       ${renderStatusTimeline(job)}
+      ${renderTagStrip(job)}
     </div>
     ${renderNotesBlock(job)}
     <div class="detail-section-label">Job description</div>
@@ -922,6 +942,122 @@ async function handleStatusPickerChange(event) {
   }
 }
 
+// ---------- Tag strip handlers (inline add / remove / click-to-filter) ----------
+
+function findJobById(jobId) {
+  if (currentJobFull?.id === jobId) return currentJobFull;
+  return cachedJobs.find((j) => j.id === jobId) ?? null;
+}
+
+async function persistTagChange(jobId, nextTags) {
+  try {
+    const resp = await send('update-job', {
+      id: jobId,
+      patch: { tags: nextTags },
+    });
+    if (!resp?.ok) throw new Error(resp?.error ?? 'update failed');
+    // Refresh whichever views are affected. refreshJobs reloads cachedJobs;
+    // detail view needs a separate `get` to pick up the new tags array.
+    await refreshJobs();
+    if (currentView === 'detail' && currentJobId === jobId) {
+      const get = await send('get', { id: jobId });
+      if (get?.ok && get.job) {
+        currentJobFull = get.job;
+        renderDetail();
+      }
+    }
+  } catch (err) {
+    console.error('[tag] update failed', err);
+    alert(`Couldn't update tags: ${String(err?.message ?? err)}`);
+  }
+}
+
+async function addTagToJob(jobId, raw) {
+  const tag = raw.trim().slice(0, 30);
+  if (!tag) return;
+  const job = findJobById(jobId);
+  if (!job) return;
+  const current = Array.isArray(job.tags) ? job.tags : [];
+  if (current.includes(tag)) return; // dedup, no-op
+  if (current.length >= 20) return; // hard cap matches normalizeTags
+  await persistTagChange(jobId, [...current, tag]);
+}
+
+async function removeTagFromJob(jobId, tag) {
+  const job = findJobById(jobId);
+  if (!job) return;
+  const current = Array.isArray(job.tags) ? job.tags : [];
+  await persistTagChange(jobId, current.filter((t) => t !== tag));
+}
+
+function swapAddBtnForInput(addBtn) {
+  const jobId = addBtn.dataset.jobId;
+  if (!jobId) return;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'tag-input';
+  input.placeholder = 'tag…';
+  input.maxLength = 30;
+  input.dataset.jobId = jobId;
+  addBtn.replaceWith(input);
+  input.focus();
+
+  let settled = false;
+  const restore = () => {
+    if (settled) return;
+    settled = true;
+    if (input.isConnected) input.replaceWith(addBtn);
+  };
+  const finish = async (commit) => {
+    const value = input.value.trim();
+    restore();
+    if (commit && value) await addTagToJob(jobId, value);
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      finish(false);
+    }
+  });
+  // Blur is the implicit-cancel path for clicks elsewhere.
+  input.addEventListener('blur', () => finish(false));
+}
+
+function filterByTag(tag) {
+  if (currentView === 'detail') showLibrary();
+  filterInput.value = tag;
+  renderJobsList();
+  renderPipelineStrip();
+}
+
+function handleTagStripClick(event) {
+  const t = event.target;
+  if (!(t instanceof HTMLElement)) return false;
+
+  const removeBtn = t.closest('.tag-chip-remove');
+  if (removeBtn) {
+    event.stopPropagation();
+    removeTagFromJob(removeBtn.dataset.jobId, removeBtn.dataset.tag);
+    return true;
+  }
+  const chip = t.closest('.tag-chip');
+  if (chip) {
+    event.stopPropagation();
+    filterByTag(chip.dataset.tag);
+    return true;
+  }
+  const addBtn = t.closest('.tag-add-btn');
+  if (addBtn) {
+    event.stopPropagation();
+    swapAddBtnForInput(addBtn);
+    return true;
+  }
+  return false;
+}
+
 async function handleDeleteClick(event) {
   const btn = event.target.closest('.delete-btn');
   if (!btn) return;
@@ -949,6 +1085,9 @@ jobsEl.addEventListener('change', handleStatusPickerChange);
 jobsEl.addEventListener('click', (event) => {
   const t = event.target;
   if (t.closest('.delete-btn')) return handleDeleteClick(event);
+  if (t.closest('.tag-strip')) {
+    if (handleTagStripClick(event)) return;
+  }
   if (t.closest('.row-actions')) return;
   const row = t.closest('.row[data-job-id]');
   if (row) showDetail(row.dataset.jobId);
@@ -976,6 +1115,9 @@ detailContent.addEventListener('click', (event) => {
   const t = event.target;
   if (!(t instanceof HTMLElement)) return;
   if (t.closest('.delete-btn')) return handleDeleteClick(event);
+  if (t.closest('.tag-strip')) {
+    if (handleTagStripClick(event)) return;
+  }
   if (t.classList.contains('edit-detail-btn')) return handleEditClick();
   if (t.classList.contains('save-btn')) return handleSaveClick(event);
   if (t.classList.contains('cancel-btn')) return handleCancelClick();
@@ -1019,6 +1161,17 @@ async function handleCleanupClick() {
       const get = await send('get', { id: currentJobId });
       if (get?.ok && get.job) currentJobFull = get.job;
     }
+    // Update the cached list row's preview so the row reflects the new
+    // oneliner without a full re-list. Mirrors the partial-update pattern
+    // used by status/tag changes.
+    const cachedRow = cachedJobs.find((j) => j.id === currentJobId);
+    if (cachedRow) {
+      const next = currentJobFull?.oneliner;
+      if (typeof next === 'string' && next.trim()) {
+        cachedRow.preview = next;
+        renderJobsList();
+      }
+    }
     bodyViewMode = 'cleaned';
     renderDetail();
     const prevTitle = toolbarTitle.textContent;
@@ -1060,6 +1213,11 @@ async function handleSaveClick(event) {
   const follow_up_at = parseDateInputValue(
     form.querySelector('.edit-follow-up').value,
   );
+  const tags = form
+    .querySelector('.edit-tags')
+    .value.split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
 
   // Decide whether the embed-input fields changed; the background's
   // update-job handler does the same check, but doing it here lets the
@@ -1080,7 +1238,7 @@ async function handleSaveClick(event) {
   try {
     const resp = await send('update-job', {
       id: currentJobFull.id,
-      patch: { title, company, location, raw_text, notes, follow_up_at },
+      patch: { title, company, location, raw_text, notes, follow_up_at, tags },
     });
     if (!resp?.ok) throw new Error(resp?.error ?? 'save failed');
     const get = await send('get', { id: currentJobFull.id });

@@ -81,6 +81,24 @@ function buildEmbedText({ title, company, location, raw_text }) {
   return [header, raw_text].filter(Boolean).join('\n\n');
 }
 
+// User tag input is untrusted — trim, dedupe (case-sensitive to preserve
+// the user's chosen casing), drop empties, cap length and count. Server-side
+// defense in depth; the side panel also validates.
+function normalizeTags(input) {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of input) {
+    if (typeof raw !== 'string') continue;
+    const t = raw.trim().slice(0, 30);
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
 function inferSeniority(title) {
   const t = (title ?? '').toLowerCase();
   if (/\b(staff|principal|distinguished|fellow)\b/.test(t)) return 'staff+';
@@ -284,9 +302,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       try {
         const jobs = await listJobs();
         const profileVersion = await getProfileVersion();
-        const slim = jobs.map(({ raw_text, match_facts, ...rest }) => ({
+        const slim = jobs.map(({ raw_text, oneliner, match_facts, ...rest }) => ({
           ...rest,
-          preview: raw_text.slice(0, 200),
+          // Prefer the LLM oneliner from cleanup; fall back to a raw_text
+          // snippet for rows that haven't been cleaned yet.
+          preview:
+            (typeof oneliner === 'string' && oneliner.trim()) ||
+            raw_text.slice(0, 200),
         }));
         sendResponse({ ok: true, jobs: slim, profile_version: profileVersion });
       } catch (err) {
@@ -370,11 +392,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         };
         if ('notes' in patch) changes.notes = patch.notes ?? null;
         if ('follow_up_at' in patch) changes.follow_up_at = patch.follow_up_at ?? null;
+        if ('tags' in patch) changes.tags = normalizeTags(patch.tags);
         // Invalidate cached LLM cleanup when raw_text changed — the cleaned
-        // version is stale once the source text moves.
+        // version (and the oneliner derived from it) are stale once the
+        // source text moves.
         if (nextRawText !== existing.raw_text) {
           changes.cleaned_text = null;
           changes.cleaned_at = null;
+          changes.oneliner = null;
         }
 
         let vector = null;
@@ -703,6 +728,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const next = await updateJob(id, {
           cleaned_text: out.cleanedText,
           cleaned_at: Date.now(),
+          oneliner: out.oneliner ?? null,
         });
         sendResponse({
           ok: true,

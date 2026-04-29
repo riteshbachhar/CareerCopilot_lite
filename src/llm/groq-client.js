@@ -1,6 +1,9 @@
-// Groq client for JD body cleanup. The LLM's only job is to filter + reorganize
+// Groq client for JD body cleanup. The LLM's job is to filter + reorganize
 // captured text into clean markdown sections — never paraphrase, summarize,
-// or invent content. Per CLAUDE.md, output is text but never "authored" prose.
+// or invent content. Per CLAUDE.md, the cleanup also returns a single
+// short factual one-line role summary used as the list-row preview; this
+// is the only authored prose this project permits, and it must stay
+// factual and ≤140 chars.
 //
 // Failure modes (all return {cleanedText: null, error|skipped}, never throw):
 //   - no key / disabled       → skipped: 'no-key' | 'disabled'
@@ -9,20 +12,34 @@
 //                                                   cleanup output can be large)
 //   - non-2xx response        → error: '<status> <statusText> — <provider msg>'
 //   - empty response content  → error: 'malformed-response'
+//   - JSON envelope unparseable → error: 'malformed-json'
 
 const ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 const TIMEOUT_MS = 30_000;
 const MAX_RAW_CHARS = 16_000;
+const ONELINER_MAX_CHARS = 140;
 
-const SYSTEM_PROMPT = `You are a job description cleaner. Your job is to take a raw, scraped job description body and reorganize it into clean, well-structured markdown — without changing the meaning of any sentence.
+const SYSTEM_PROMPT = `You are a job description cleaner. Given a raw, scraped job description body, you produce two outputs and return them as a single JSON object.
 
-REQUIREMENTS:
+OUTPUT 1 — "cleaned_markdown": the JD body reorganized into clean, well-structured markdown without changing the meaning of any sentence.
 - Group related bullets under proper section headings using "## " prefix (e.g. "## About the role", "## Responsibilities", "## Requirements", "## Nice to have", "## Benefits", "## Compensation"). Pick headings that fit the content; do not invent generic ones if the content does not warrant them.
 - Drop content that is not part of the job description: "Apply now" buttons, cookie banners, sign-in prompts, navigation chrome, footer text, EEO/diversity boilerplate, repeated CTAs, "Share this job" links.
 - Preserve all substantive job description content. Every responsibility, requirement, qualification, perk, and benefit listed in the input must appear somewhere in the output.
 - Preserve sentence-level wording. You may fix obvious whitespace and capitalization issues, but DO NOT paraphrase, summarize, or rephrase any sentence.
 - DO NOT invent or add content that is not present in the input.
-- Output ONLY the cleaned markdown. No preamble ("Here is the cleaned..."), no commentary, no closing remarks, no code fences.`;
+
+OUTPUT 2 — "oneliner": a single factual sentence describing the role, used as a list-row preview.
+- Plain text only. No markdown, no headings, no bullets, no quotation marks around the whole thing.
+- ≤ ${ONELINER_MAX_CHARS} characters total.
+- Must contain: the role title, the company (if known), and one distinguishing detail (domain, tech stack, location, or seniority). Example: "Senior backend engineer at Acme building payments infra in Go, remote US."
+- NO marketing language ("amazing opportunity", "fast-growing", "join our team", "we're looking for"). NO superlatives. NO recruiter prose.
+- If the input is too sparse to identify the role + a distinguishing detail, return null for "oneliner".
+
+OUTPUT — return ONLY this JSON, no commentary, no preamble, no code fences:
+{
+  "cleaned_markdown": "...",
+  "oneliner": "..." | null
+}`;
 
 async function postChatCompletion({
   apiKey,
@@ -58,12 +75,27 @@ async function readErrorDetail(res) {
   }
 }
 
-// Strip a wrapping ```markdown … ``` fence if the model added one despite the
-// prompt asking it not to. Idempotent.
-function stripCodeFence(s) {
-  const trimmed = s.trim();
-  const m = /^```(?:markdown|md)?\n([\s\S]*?)\n```$/.exec(trimmed);
-  return m ? m[1].trim() : trimmed;
+// Validate + sanitize a oneliner string from the LLM. Returns a clean
+// string or null. Strips markdown chrome and enforces the char cap.
+function sanitizeOneliner(s) {
+  if (typeof s !== 'string') return null;
+  let v = s
+    .replace(/^[\s>#*\-]+/, '') // leading markdown chrome
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!v) return null;
+  // Drop wrapping quotes if the model wrapped the whole sentence.
+  if (
+    (v.startsWith('"') && v.endsWith('"')) ||
+    (v.startsWith('“') && v.endsWith('”')) ||
+    (v.startsWith("'") && v.endsWith("'"))
+  ) {
+    v = v.slice(1, -1).trim();
+  }
+  if (v.length > ONELINER_MAX_CHARS) {
+    v = v.slice(0, ONELINER_MAX_CHARS - 1).trimEnd() + '…';
+  }
+  return v;
 }
 
 export async function cleanupJd({ rawText, settings }) {
@@ -87,6 +119,7 @@ export async function cleanupJd({ rawText, settings }) {
       model: settings.model || 'llama-3.1-8b-instant',
       signal: controller.signal,
       maxTokens: 4000,
+      jsonMode: true,
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: input },
@@ -101,8 +134,21 @@ export async function cleanupJd({ rawText, settings }) {
     if (typeof content !== 'string' || !content.trim()) {
       return { cleanedText: null, error: 'malformed-response' };
     }
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      return { cleanedText: null, error: 'malformed-json' };
+    }
+    const cleanedText = typeof parsed?.cleaned_markdown === 'string'
+      ? parsed.cleaned_markdown.trim()
+      : '';
+    if (!cleanedText) {
+      return { cleanedText: null, error: 'malformed-response' };
+    }
     return {
-      cleanedText: stripCodeFence(content),
+      cleanedText,
+      oneliner: sanitizeOneliner(parsed?.oneliner),
       latencyMs: Math.round(performance.now() - t0),
     };
   } catch (err) {
