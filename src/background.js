@@ -351,14 +351,57 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type === 'capture-tab') {
+    // Defined inside the listener so the helper closes over nothing; pure.
+    /* eslint-disable no-inner-declarations */
+    function pickBestExtraction(results) {
+      // Each InjectionResult is {frameId, result, error?}. Priority within
+      // ok results: json-ld > readability > dom-text; within a tier, the
+      // top frame (frameId === 0) wins so LinkedIn / direct JD pages are
+      // not stolen by sidebar widgets or related-jobs iframes; tiebreak on
+      // description length so iframe-embedded JDs (Greenhouse on
+      // evergreenresi.com, etc.) still beat a stub top frame.
+      const ok = (results ?? [])
+        .map((r) => ({ frameId: r?.frameId, ...r?.result }))
+        .filter((r) => r.ok && r.jd?.description?.length);
+      if (ok.length) {
+        const sourceRank = { 'json-ld': 0, readability: 1, 'dom-text': 2 };
+        ok.sort((a, b) => {
+          const sa = sourceRank[a.jd.source] ?? 9;
+          const sb = sourceRank[b.jd.source] ?? 9;
+          if (sa !== sb) return sa - sb;
+          // Top frame wins ties — it's the user's intended target.
+          const ta = a.frameId === 0 ? 0 : 1;
+          const tb = b.frameId === 0 ? 0 : 1;
+          if (ta !== tb) return ta - tb;
+          return (b.jd.description?.length ?? 0) - (a.jd.description?.length ?? 0);
+        });
+        return ok[0];
+      }
+      // No frame succeeded — surface the most descriptive failure (the one
+      // with the longest error text, usually the substantive frame's
+      // "DOM text too short" rather than an empty about:blank frame).
+      const errs = (results ?? [])
+        .map((r) => r?.result)
+        .filter((r) => r && r.error);
+      errs.sort((a, b) => (b.error?.length ?? 0) - (a.error?.length ?? 0));
+      return errs[0] ?? { ok: false, error: 'extraction failed in all frames' };
+    }
+    /* eslint-enable no-inner-declarations */
+
     (async () => {
       try {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         if (!tab?.id) throw new Error('no active tab');
 
+        // Inject Readability and run the extractor in every frame, not just
+        // the top one. Many sites (Greenhouse-embedded boards like
+        // evergreenresi.com/careers/?gh_jid=…, Lever widgets, Workable embeds)
+        // wrap a cross-origin iframe that holds the actual JD; the host frame
+        // is just chrome and renders ~10 chars of DOM text. With allFrames we
+        // get one result per frame and pick the substantive one below.
         try {
           await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: { tabId: tab.id, allFrames: true },
             files: ['readability.js'],
           });
         } catch (err) {
@@ -366,10 +409,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
 
         const results = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
+          target: { tabId: tab.id, allFrames: true },
           func: extractJobPostingFromPage,
         });
-        const extracted = results?.[0]?.result;
+        const extracted = pickBestExtraction(results);
         if (!extracted?.ok) {
           throw new Error(extracted?.error ?? 'extraction failed');
         }
