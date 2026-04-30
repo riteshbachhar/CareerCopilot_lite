@@ -129,7 +129,7 @@ function getActiveProfileId(job) {
 // Must stay in sync with MATCH_ALGO_VERSION in background.js. Bumping it
 // invalidates every cached match_score so the existing strikethrough +
 // Recompute UX picks up rows scored under the old algo.
-const MATCH_ALGO_VERSION = 'coverage-v1';
+const MATCH_ALGO_VERSION = 'coverage-v2';
 
 function isMatchFresh(job) {
   if (job.match_score == null) return false;

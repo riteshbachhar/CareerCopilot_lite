@@ -22,8 +22,34 @@ test('chunkJD: cleaned_text path splits H2 sections into bullet chunks', () => {
   ].join('\n');
   const chunks = chunkJD({ cleaned_text: cleaned, raw_text: '' });
   assert.equal(chunks.length, 4);
-  assert.match(chunks[0], /Design and ship distributed systems/);
-  assert.match(chunks[3], /Kubernetes operators/);
+  assert.match(chunks[0].text, /Design and ship distributed systems/);
+  assert.equal(chunks[0].section, 'Responsibilities');
+  assert.match(chunks[3].text, /Kubernetes operators/);
+  assert.equal(chunks[3].section, 'Requirements');
+});
+
+test('chunkJD: H3 under H2 overrides the section tag (most recent heading wins)', () => {
+  const cleaned = [
+    '## Requirements',
+    '### Must have',
+    '- 5+ years of Python or Go in production environments at scale',
+    '### Nice to have',
+    '- Experience with Kubernetes operators and service mesh patterns',
+  ].join('\n');
+  const chunks = chunkJD({ cleaned_text: cleaned });
+  assert.equal(chunks.length, 2);
+  assert.equal(chunks[0].section, 'Must have');
+  assert.equal(chunks[1].section, 'Nice to have');
+});
+
+test('chunkJD: raw_text without headings yields section: null', () => {
+  const raw = [
+    '- Lead a team of eight engineers building the core scheduling system',
+    '- Own the on-call rotation and incident response for production services',
+  ].join('\n');
+  const chunks = chunkJD({ raw_text: raw });
+  assert.equal(chunks.length, 2);
+  for (const c of chunks) assert.equal(c.section, null);
 });
 
 test('chunkJD: drops boilerplate sections (Benefits, EEO, About us)', () => {
@@ -40,7 +66,7 @@ test('chunkJD: drops boilerplate sections (Benefits, EEO, About us)', () => {
   ].join('\n');
   const chunks = chunkJD({ cleaned_text: cleaned });
   assert.equal(chunks.length, 1);
-  assert.match(chunks[0], /5\+ years of backend/);
+  assert.match(chunks[0].text, /5\+ years of backend/);
 });
 
 test('chunkJD: raw_text fallback splits bullet blocks into one chunk per bullet', () => {
@@ -55,7 +81,7 @@ test('chunkJD: raw_text fallback splits bullet blocks into one chunk per bullet'
   const chunks = chunkJD({ raw_text: raw });
   // The "What you will do:" line is < MIN_WORDS, gets filtered. 3 bullets remain.
   assert.equal(chunks.length, 3);
-  assert.match(chunks[0], /Lead a team of eight engineers/);
+  assert.match(chunks[0].text, /Lead a team of eight engineers/);
 });
 
 test('chunkJD: raw_text prose path splits paragraphs into sentences', () => {
@@ -66,9 +92,9 @@ test('chunkJD: raw_text prose path splits paragraphs into sentences', () => {
   ].join('\n');
   const chunks = chunkJD({ raw_text: raw });
   assert.equal(chunks.length, 3);
-  assert.match(chunks[0], /design distributed systems/);
-  assert.match(chunks[1], /collaborate with product managers/);
-  assert.match(chunks[2], /mentor more junior engineers/);
+  assert.match(chunks[0].text, /design distributed systems/);
+  assert.match(chunks[1].text, /collaborate with product managers/);
+  assert.match(chunks[2].text, /mentor more junior engineers/);
 });
 
 test('chunkJD: prefers cleaned_text when both supplied', () => {
@@ -76,7 +102,7 @@ test('chunkJD: prefers cleaned_text when both supplied', () => {
   const raw = '- raw bullet that should not appear because cleaned is preferred';
   const chunks = chunkJD({ raw_text: raw, cleaned_text: cleaned });
   assert.equal(chunks.length, 1);
-  assert.match(chunks[0], /Build and ship distributed systems/);
+  assert.match(chunks[0].text, /Build and ship distributed systems/);
 });
 
 test('chunkJD: filters chunks that are too short', () => {
@@ -97,7 +123,7 @@ test('chunkJD: filters boilerplate chunks (apply now, EEO, click here)', () => {
   ].join('\n');
   const chunks = chunkJD({ raw_text: raw });
   assert.equal(chunks.length, 1);
-  assert.match(chunks[0], /Build and ship distributed systems/);
+  assert.match(chunks[0].text, /Build and ship distributed systems/);
 });
 
 test('chunkJD: truncates over-long chunks at MAX_WORDS', () => {
@@ -106,9 +132,9 @@ test('chunkJD: truncates over-long chunks at MAX_WORDS', () => {
     Array.from({ length: 100 }, (_, i) => `word${i}`).join(' ');
   const chunks = chunkJD({ raw_text: longBullet });
   assert.equal(chunks.length, 1);
-  assert.ok(chunks[0].endsWith('…'));
+  assert.ok(chunks[0].text.endsWith('…'));
   // Truncated to ~60 words (MAX_WORDS) plus the ellipsis.
-  assert.ok(chunks[0].split(/\s+/).length <= 61);
+  assert.ok(chunks[0].text.split(/\s+/).length <= 61);
 });
 
 test('chunkJD: caps total chunks at 30', () => {
@@ -148,5 +174,5 @@ test('chunkJD: numbered list bullets recognized as bullets', () => {
   ].join('\n');
   const chunks = chunkJD({ raw_text: raw });
   assert.equal(chunks.length, 3);
-  assert.match(chunks[0], /^First requirement/);
+  assert.match(chunks[0].text, /^First requirement/);
 });

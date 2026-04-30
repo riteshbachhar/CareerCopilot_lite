@@ -297,6 +297,7 @@ export async function putJdChunks(jd_id, chunks) {
           jd_id,
           chunk_index: c.chunk_index,
           chunk_text: c.chunk_text,
+          section: c.section ?? null,
           vector: buf,
           dims: c.dims,
           model_id: c.model_id,

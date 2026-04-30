@@ -47,7 +47,7 @@ const OFFSCREEN_URL = 'offscreen.html';
 // match_algo_version doesn't match this constant are treated as stale by
 // the side panel, forcing a recompute via the existing strikethrough +
 // Recompute UX rather than silently coexisting at incomparable scales.
-const MATCH_ALGO_VERSION = 'coverage-v1';
+const MATCH_ALGO_VERSION = 'coverage-v2';
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -102,7 +102,8 @@ async function chunkAndEmbedJD({ raw_text, cleaned_text }) {
   let modelVersion = null;
   const chunkRows = [];
   for (let i = 0; i < chunks.length; i++) {
-    const out = await embedViaOffscreen(chunks[i]);
+    const c = chunks[i];
+    const out = await embedViaOffscreen(c.text);
     if (i === 0) {
       coldStartMs = out.coldStartMs ?? 0;
       embedMs = out.embedMs ?? 0;
@@ -111,7 +112,8 @@ async function chunkAndEmbedJD({ raw_text, cleaned_text }) {
     }
     chunkRows.push({
       chunk_index: i,
-      chunk_text: chunks[i],
+      chunk_text: c.text,
+      section: c.section ?? null,
       vector: out.vector,
       dims: out.dims,
       model_id: out.modelId,
@@ -451,6 +453,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
                 chunk_text: f.chunk_text ?? null,
                 fact_id: f.fact_id ?? null,
                 score: f.score,
+                weight: f.weight ?? 1.0,
                 section: fact?.section ?? null,
                 subsection: fact?.subsection ?? null,
                 text: fact?.text ?? '',

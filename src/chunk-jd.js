@@ -79,12 +79,15 @@ function isHeadingLine(line) {
   return /^#{1,6}\s+\S/.test(line);
 }
 
-// Walk lines, emit candidate chunk strings respecting section context.
-// Returns the raw candidate list before length / boilerplate filtering.
+// Walk lines, emit candidate chunks tagged with their current section
+// context. Section = the most recent kept heading text (any level), or
+// null when no heading has been seen (raw-text inputs without structure).
+// Returns [{text, section}] before length / boilerplate filtering.
 function extractCandidates(text) {
   const lines = text.replace(/\r\n/g, '\n').split('\n');
   const out = [];
   let dropSection = false;
+  let currentSection = null;
   let proseBuf = [];
 
   const flushProse = () => {
@@ -96,7 +99,9 @@ function extractCandidates(text) {
     // claim, mirroring the per-bullet treatment. Sentences below MIN_WORDS
     // are dropped by the length filter; sentences above MAX_WORDS are
     // truncated there.
-    for (const s of splitSentences(para)) out.push(s);
+    for (const s of splitSentences(para)) {
+      out.push({ text: s, section: currentSection });
+    }
   };
 
   for (const rawLine of lines) {
@@ -109,12 +114,13 @@ function extractCandidates(text) {
       flushProse();
       const header = stripHeadingMarker(line);
       dropSection = DROP_SECTION_RE.test(header);
+      currentSection = dropSection ? null : header;
       continue;
     }
     if (isBulletLine(line)) {
       flushProse();
       if (dropSection) continue;
-      out.push(stripBulletMarker(line));
+      out.push({ text: stripBulletMarker(line), section: currentSection });
       continue;
     }
     proseBuf.push(line.trim());
@@ -125,20 +131,21 @@ function extractCandidates(text) {
 
 // Apply length and boilerplate filters; truncate over-long chunks at the
 // MAX_WORDS boundary rather than dropping (a 70-word bullet often still has
-// useful signal in its first clause).
+// useful signal in its first clause). Preserves the section tag from the
+// candidate.
 function filterAndTruncate(candidates) {
   const out = [];
   for (const c of candidates) {
-    const trimmed = c.replace(/\s+/g, ' ').trim();
+    const trimmed = c.text.replace(/\s+/g, ' ').trim();
     if (!trimmed) continue;
     if (looksLikeBoilerplate(trimmed)) continue;
     const wc = wordCount(trimmed);
     if (wc < MIN_WORDS) continue;
     if (wc > MAX_WORDS) {
       const words = trimmed.split(/\s+/).slice(0, MAX_WORDS);
-      out.push(words.join(' ') + '…');
+      out.push({ text: words.join(' ') + '…', section: c.section });
     } else {
-      out.push(trimmed);
+      out.push({ text: trimmed, section: c.section });
     }
   }
   return out;
@@ -154,12 +161,13 @@ export function chunkJD({ raw_text, cleaned_text } = {}) {
   if (!text.trim()) return [];
   const candidates = extractCandidates(text);
   const filtered = filterAndTruncate(candidates);
-  // Dedupe identical chunks (cleaned text occasionally repeats lines).
+  // Dedupe by text (cleaned text occasionally repeats lines). First
+  // occurrence wins; section tag from that first occurrence is kept.
   const seen = new Set();
   const unique = [];
   for (const c of filtered) {
-    if (seen.has(c)) continue;
-    seen.add(c);
+    if (seen.has(c.text)) continue;
+    seen.add(c.text);
     unique.push(c);
     if (unique.length >= MAX_CHUNKS) break;
   }
