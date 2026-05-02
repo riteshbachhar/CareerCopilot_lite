@@ -1165,6 +1165,7 @@ function swapAddBtnForInput(addBtn) {
 function filterByTag(tag) {
   if (currentView === 'detail') showLibrary();
   filterInput.value = tag;
+  saveListViewPrefs();
   renderJobsList();
   renderPipelineStrip();
 }
@@ -1232,17 +1233,25 @@ jobsEl.addEventListener('click', (event) => {
   if (row) showDetail(row.dataset.jobId);
 });
 
-filterInput.addEventListener('input', renderJobsList);
+filterInput.addEventListener('input', () => {
+  saveListViewPrefs();
+  renderJobsList();
+});
 statusFilter.addEventListener('change', () => {
+  saveListViewPrefs();
   renderJobsList();
   renderPipelineStrip();
 });
-sortMode.addEventListener('change', renderJobsList);
+sortMode.addEventListener('change', () => {
+  saveListViewPrefs();
+  renderJobsList();
+});
 
 pipelineStrip.addEventListener('click', (event) => {
   const chip = event.target.closest('.pipeline-chip');
   if (!chip) return;
   statusFilter.value = chip.dataset.status;
+  saveListViewPrefs();
   renderJobsList();
   renderPipelineStrip();
 });
@@ -2022,6 +2031,31 @@ function populateSortDropdown() {
   sortMode.value = DEFAULT_SORT;
 }
 
+// List-view filter / sort prefs persist in chrome.storage.local so the
+// side panel remembers them across reopens. Side-panel close is a full
+// page unload, so without this the controls reset to their HTML defaults.
+const LIST_VIEW_PREFS_KEY = 'list_view_prefs';
+
+async function loadListViewPrefs() {
+  const out = await chrome.storage.local.get(LIST_VIEW_PREFS_KEY);
+  const prefs = out[LIST_VIEW_PREFS_KEY] ?? {};
+  if (typeof prefs.filter === 'string') filterInput.value = prefs.filter;
+  if (typeof prefs.status === 'string') statusFilter.value = prefs.status;
+  if (typeof prefs.sort === 'string' && SORT_MODES.some((m) => m.value === prefs.sort)) {
+    sortMode.value = prefs.sort;
+  }
+}
+
+function saveListViewPrefs() {
+  chrome.storage.local.set({
+    [LIST_VIEW_PREFS_KEY]: {
+      filter: filterInput.value,
+      status: statusFilter.value,
+      sort: sortMode.value,
+    },
+  });
+}
+
 // Background pings for long-running ingest + match-stale notifications.
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.target !== 'sidepanel') return false;
@@ -2053,4 +2087,4 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 populateSortDropdown();
 refreshSettingsDrawer();
-refreshJobs();
+loadListViewPrefs().then(refreshJobs);
