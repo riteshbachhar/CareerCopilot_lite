@@ -10,3 +10,6 @@ build/
 
 # Personal profile data — never commit. Use profile.example.md for shareable samples.
 profile.md
+
+# Local data snapshots from the side-panel JSON export.
+backup/
