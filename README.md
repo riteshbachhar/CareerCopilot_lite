@@ -141,4 +141,4 @@ This is a sibling to `../CareerPilot`, not a fork. It exists separately so the t
 
 ## License
 
-Private. Not yet published.
+MIT © 2026 Ritesh Bachhar
