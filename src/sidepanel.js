@@ -1019,11 +1019,11 @@ async function handleStatusPickerChange(event) {
     if (!resp?.ok) throw new Error(resp?.error ?? 'set-status failed');
     const row = cachedJobs.find((j) => j.id === jobId);
     if (row) row.status = status;
+    renderJobsList();
+    renderPipelineStrip();
     if (currentView === 'detail' && currentJobId === jobId && currentJobFull) {
       currentJobFull.status = status;
       renderDetail();
-    } else {
-      renderJobsList();
     }
   } catch (err) {
     console.error('[status] failed to update', err);
@@ -1059,6 +1059,7 @@ async function handleRowProfilePickerChange(event) {
       row.match_profile_version = resp.job.match_profile_version;
       row.match_profile_id = resp.job.match_profile_id;
     }
+    renderJobsList();
     if (currentView === 'detail' && currentJobId === jobId && resp.job) {
       currentJobFull = resp.job;
       // Re-fetch hydrated facts for the detail view.
@@ -1067,8 +1068,6 @@ async function handleRowProfilePickerChange(event) {
         currentJobMatchFacts = get.hydrated_match_facts ?? null;
       }
       renderDetail();
-    } else {
-      renderJobsList();
     }
     refreshRecomputeBanner();
   } catch (err) {
