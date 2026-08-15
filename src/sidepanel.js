@@ -4,6 +4,8 @@ import {
   SORT_MODES,
   DEFAULT_SORT,
   STATUS_ORDER,
+  LLM_MODELS,
+  DEFAULT_LLM_MODEL,
 } from './constants.js';
 
 const $ = (id) => document.getElementById(id);
@@ -883,13 +885,24 @@ profileBackdrop.addEventListener('click', closeProfile);
 
 // ---------- Settings drawer ----------
 
+// Build the model picker from the shared catalog so the drawer can't drift
+// from the id groq-client falls back to.
+settingsModel.innerHTML = LLM_MODELS.map(
+  (m) => `<option value="${m.value}">${escapeHtml(m.label)}</option>`,
+).join('');
+
 async function refreshSettingsDrawer() {
   try {
     const resp = await send('get-llm-settings');
     if (!resp?.ok) return;
     const s = resp.settings;
     llmEnabledHasKey = !!(s.hasKey && s.enabled);
-    settingsModel.value = s.model || 'llama-3.1-8b-instant';
+    // getLlmSettings already migrates retired ids, but a value with no
+    // matching <option> would silently blank the select — fall back so the
+    // saved model always renders as something.
+    settingsModel.value = LLM_MODELS.some((m) => m.value === s.model)
+      ? s.model
+      : DEFAULT_LLM_MODEL;
     settingsEnabled.checked = !!s.enabled;
     if (s.hasKey) {
       settingsApiKey.value = '';

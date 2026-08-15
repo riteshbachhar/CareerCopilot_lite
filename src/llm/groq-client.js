@@ -14,6 +14,8 @@
 //   - empty response content  → error: 'malformed-response'
 //   - JSON envelope unparseable → error: 'malformed-json'
 
+import { DEFAULT_LLM_MODEL } from '../constants.js';
+
 const ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 const TIMEOUT_MS = 30_000;
 const MAX_RAW_CHARS = 16_000;
@@ -116,7 +118,7 @@ export async function cleanupJd({ rawText, settings }) {
   try {
     const res = await postChatCompletion({
       apiKey: settings.apiKey,
-      model: settings.model || 'llama-3.1-8b-instant',
+      model: settings.model || DEFAULT_LLM_MODEL,
       signal: controller.signal,
       maxTokens: 4000,
       jsonMode: true,
@@ -213,7 +215,7 @@ export async function extractResumeFacts({ rawText, settings }) {
   try {
     const res = await postChatCompletion({
       apiKey: settings.apiKey,
-      model: settings.model || 'llama-3.1-8b-instant',
+      model: settings.model || DEFAULT_LLM_MODEL,
       signal: controller.signal,
       maxTokens: 4000,
       jsonMode: true,
@@ -258,7 +260,7 @@ export async function testGroqConnection(settings) {
   try {
     const res = await postChatCompletion({
       apiKey: settings.apiKey,
-      model: settings.model || 'llama-3.1-8b-instant',
+      model: settings.model || DEFAULT_LLM_MODEL,
       signal: controller.signal,
       maxTokens: 8,
       messages: [{ role: 'user', content: 'reply with the single word OK' }],

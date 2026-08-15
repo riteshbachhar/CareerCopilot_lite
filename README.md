@@ -18,7 +18,7 @@ Capture a job posting from any tab, embed it locally, and score it against your 
 - `@huggingface/transformers` (`all-MiniLM-L6-v2` quantized to int8) for embeddings. ONNX Runtime Web bundled locally so first-run model download is the only network hop.
 - `@mozilla/readability` injected as a classic script for the Readability fallback.
 - `pdfjs-dist` for resume PDF extraction in the offscreen doc.
-- Groq API (`llama-3.1-8b-instant` default, `llama-3.3-70b-versatile` recommended for cleanup) — only called for cleanup and resume parsing, both gated behind a BYOK key.
+- Groq API (`openai/gpt-oss-120b` default, or `qwen/qwen3.6-27b` for faster turnaround) — only called for cleanup and resume parsing, both gated behind a BYOK key.
 
 ## Install
 

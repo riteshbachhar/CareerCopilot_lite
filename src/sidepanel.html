@@ -985,12 +985,8 @@
 
       <label class="field" style="display:flex; flex-direction:column; gap:4px;">
         <span style="opacity:0.75; font-size:11px;">Model</span>
-        <select id="settings-model">
-          <option value="llama-3.1-8b-instant">llama-3.1-8b-instant (fast, default)</option>
-          <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile (best quality)</option>
-          <option value="mixtral-8x7b-32768">mixtral-8x7b (long context)</option>
-          <option value="gemma2-9b-it">gemma2-9b-it</option>
-        </select>
+        <!-- Options are rendered from LLM_MODELS in constants.js. -->
+        <select id="settings-model"></select>
       </label>
 
       <label style="display:flex; align-items:center; gap:6px; font-size:12px;">
