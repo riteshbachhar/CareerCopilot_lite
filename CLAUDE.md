@@ -2,147 +2,197 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project state
+## Project charter
 
-Career Copilot Lite is a stripped-down sibling of the full Career Copilot project (at `../CareerPilot`). It ships a focused MVP: a **detailed job tracker** plus a **profile match checker**. Grounded rewrite, cover-letter generation, and the eval harness live in the parent project. An optional LLM is permitted here for **on-demand JD body cleanup only** — reorganizing the captured `raw_text` into proper markdown sections, dropping CTAs / cookie banners / boilerplate, while preserving every substantive sentence verbatim. As a side product of that same cleanup call, the LLM also returns a single short factual one-line role summary (≤ 140 chars, plain text, no marketing prose) used as the list-row preview. That one-liner is the **only** authored sentence this project permits — paraphrase / summary of the body, rewrite, and cover-letter generation all stay in the parent project.
+Career Copilot Lite is a stripped-down sibling of the full Career Copilot project (at `../CareerPilot`). It ships a focused MVP: a **detailed job tracker** plus a **profile match checker**. Grounded rewrite, cover-letter generation, and the eval harness live in the parent project.
 
-Shipped:
-- **Capture** — MV3 scaffold, generic JSON-LD extractor with Readability + DOM-text fallback, `chrome.scripting.executeScript` on `<all_urls>`.
-- **Embeddings & vector store** — `all-MiniLM-L6-v2` (q8, 384-dim) in offscreen via `@huggingface/transformers`; IndexedDB v1 with five stores (`jobs`, `embeddings`, `profile_facts`, `profile_embeddings`, `meta`).
-- **Tracker** — capture → row with status picker (interested / applied / interviewing / offer / rejected / archived), text + status filter, inline detail view with edit (forced re-embed) and delete.
-- **Profile ingestion** — markdown chunked into atomic facts via `src/profile/parse-markdown.js`; each fact is embedded with a `section › subsection` breadcrumb prefix and persisted to `profile_facts` + `profile_embeddings`.
-- **Match checker** — every captured JD is scored against the user's profile facts on capture (and on edit). Score is the mean cosine of the top-10 facts retrieved against the JD vector. Surfaces as a colored chip on each list row and a full breakdown in detail view (score + top facts grouped by section). Re-ingesting the profile bumps a `profile_version`; stale rows show a strikethrough chip and a "Recompute" banner offers a one-click bulk refresh. Detail view also exposes per-JD "Recompute match".
+The LLM here is **optional, BYOK, and on-demand**, and is permitted for exactly two jobs:
 
-Out of scope (intentionally — these are reasons this project exists separately from the parent):
-- Rewrite UI, cover-letter / outreach drafting, or any LLM-generated user-facing prose.
+1. **JD body cleanup** — reorganize the captured `raw_text` into proper markdown sections, dropping CTAs / cookie banners / boilerplate, while preserving every substantive sentence verbatim. As a side product of that same call it returns one short factual `oneliner` (≤ 140 chars, role + company + 1 distinguishing detail, no marketing prose) used as the list-row preview. **That one-liner is the only authored sentence this project permits.**
+2. **Resume parsing** at profile-upload time — split an uploaded CV into atomic `{section, subsection, text}` facts, where `text` is verbatim from the resume.
+
+Out of scope (these are the reasons this project exists separately from the parent):
+- Rewrite UI, cover-letter / outreach drafting, JD body TL;DRs, or any other LLM-generated user-facing prose.
 - Eval harness or rewrite validators.
 - Semantic JD search across the captured corpus.
 
-In scope but optional (off by default):
-- LLM-assisted **JD body cleanup**, on-demand only. The user clicks "Clean up JD ✨" on a captured row; the LLM returns a reorganized markdown version of the body (sections like Responsibilities / Requirements / Benefits, with CTAs and chrome stripped) **plus** a single short factual one-line role summary (`oneliner`) used as the list-row preview. The original `raw_text` is preserved alongside the cleaned text so both are viewable. Capture itself never calls the LLM. Gated behind a BYOK key in the settings drawer plus an enable toggle. The LLM is permitted to **filter and reorganize** captured text but must not paraphrase or summarize the body. The one-liner is a deliberate carve-out: factual (role + company + 1 distinguishing detail), bounded (≤ 140 chars), no marketing language. That carve-out does not extend to summarizing the body, generating prose, or anything cover-letter-shaped.
-- LLM-assisted **resume parsing**, at profile-upload time only. The user uploads a CV (PDF or plain text); pdf.js extracts the text in the offscreen doc, and the LLM splits it into atomic `{section, subsection, text}` facts in the same shape the markdown parser produces. The `text` field is verbatim from the resume — no paraphrasing or summarization. Output then flows through the existing per-fact embed-and-store loop unchanged. The hand-curated markdown paste path remains as a collapsed "Advanced" option for power users.
+When in doubt: does the feature ask the model to **filter and reorganize** content the user already captured, or to **author** new content (paraphrases, summaries, drafts)? Filter-and-reorganize → here. Author → parent.
+
+## Commands
+
+```bash
+npm install                          # first time only
+npm run build                        # one-shot build into dist/
+npm run watch                        # rebuild on file changes (recommended during dev)
+npm test                             # node --test tests/*.test.js
+node --test tests/chunk-jd.test.js   # single test file
+node --test --test-name-pattern="section weight" tests/match-coverage.test.js
+npm run clean                        # rm -rf dist
+```
+
+There is no linter or typechecker configured. Tests cover the pure functions only (`chunk-jd`, `match-coverage`, `parse-markdown`, `parse-resume`, `import-jobs`) — anything touching `chrome.*` or IndexedDB is verified by the manual smoke test below.
+
+`build.mjs` runs three things:
+1. **ESM pass** for extension pages: `src/background.js`, `src/offscreen.js`, `src/sidepanel.js` → `dist/*.js`.
+2. **IIFE pass** for `src/readability-inject.js` → `dist/readability.js`. Must be IIFE, not ESM, because `chrome.scripting.executeScript({files: [...]})` expects a classic script that mutates `globalThis`.
+3. **`copyStatic()`** wipes `dist/`, copies the HTML files + `manifest.json`, copies ONNX Runtime Web WASM from `node_modules/onnxruntime-web/dist/` → `dist/wasm/`, and copies `pdf.worker.min.mjs` → `dist/pdf.worker.mjs`. Both workers are bundled locally rather than fetched: `src/embed.js` points `env.backends.onnx.wasm.wasmPaths` at `chrome.runtime.getURL('wasm/')`, and `offscreen.js` sets `pdfjsLib.GlobalWorkerOptions.workerSrc` to the local copy. CDN URLs would be blocked by `connect-src` anyway.
 
 ## Architecture
 
 Three MV3 contexts. Crossing the boundaries between them is the whole design — understand the routing before editing any of them.
 
-- **`src/sidepanel.html` / `src/sidepanel.js`** — the UI. Talks only to the background service worker.
-- **`src/background.js`** — service worker. Orchestrates the offscreen document lifecycle (`ensureOffscreen`), owns IndexedDB access, runs the capture pipeline (`persistCapture`), computes match scores (`computeAndPersistMatch`), and injects the page extractor via `chrome.scripting.executeScript`. Ephemeral: Chrome terminates it after ~30s idle, so it must re-register listeners on every wake.
-- **`src/offscreen.html` / `src/offscreen.js` / `src/embed.js`** — long-lived DOM context hosting `@huggingface/transformers`. Service workers cannot reliably host WASM/dynamic imports, which is the whole reason the offscreen document exists in this design. **Do not move model inference into `background.js`.**
-- **`src/adapters/json-ld.js`** — generic page extractor. `extractJobPostingFromPage` is a self-contained function (no imports, all helpers inlined) because Chrome serializes it to run inside the target page's isolated world. Tries schema.org `JobPosting` JSON-LD with lenient `@type` matching and `@graph` / `itemListElement` / `mainEntity` traversal, then falls back to Readability (pre-injected from `dist/readability.js`) and stripped `<main>` / `<article>` / body text.
-- **`src/match.js`** — single function `computeMatch(jdVector, {topK})`. Reuses `profileCosineSearch` from `db.js`; no model calls, no LLM. Keep this file tiny — anything fancier (asymmetric matching, JD chunking, gap analysis) should be a separate module so this stays the simple baseline.
-- **`src/profile/parse-markdown.js`** — markdown → atomic facts (section, subsection, text, order). Pure function, fully tested under `tests/parse-markdown.test.js`.
+- **`src/sidepanel.html` / `src/sidepanel.js`** — the UI (~2k lines of vanilla JS, no framework). Talks *only* to the background service worker; never messages the offscreen document directly.
+- **`src/background.js`** — service worker. Orchestrates the offscreen document lifecycle (`ensureOffscreen`), owns all IndexedDB access, runs the capture pipeline (`persistCapture`), chunks + embeds JDs (`chunkAndEmbedJD` / `rechunkAndEmbed`), computes match scores (`computeAndPersistMatch`), calls the Groq client, and injects the page extractor via `chrome.scripting.executeScript`. Ephemeral: Chrome terminates it after ~30s idle, so it must re-register listeners on every wake.
+- **`src/offscreen.html` / `src/offscreen.js` / `src/embed.js`** — long-lived DOM context hosting `@huggingface/transformers` and `pdfjs-dist`. Service workers cannot reliably host WASM/dynamic imports or spawn pdf.js workers, which is the whole reason the offscreen document exists. **Do not move model inference or PDF parsing into `background.js`.**
+
+### Module map
+
+| File | Role |
+|---|---|
+| `src/adapters/json-ld.js` | Generic page extractor. `extractJobPostingFromPage` is self-contained (no imports, all helpers inlined) because Chrome serializes it to run inside the target page's isolated world. Tries schema.org `JobPosting` JSON-LD with lenient `@type` matching and `@graph` / `itemListElement` / `mainEntity` traversal, then Readability (pre-injected), then stripped `<main>` / `<article>` / body text. |
+| `src/chunk-jd.js` | Pure. Splits a JD into atomic requirement-shaped chunks, tagged with the markdown section they came from. Drops boilerplate sections and chunk-level CTAs; 6–60 words per chunk, max 30 chunks. |
+| `src/match-coverage.js` | Pure-ish (data layer injected). **The live scorer.** Section-weighted mean of per-chunk best profile matches. |
+| `src/match.js` | The original symmetric top-K-mean baseline. **Dead code, kept for reference** — nothing imports it. |
+| `src/db.js` | IndexedDB wrapper. Every store access goes through here. |
+| `src/constants.js` | Model id/version, embedding dims, status enum + display order, sort modes. |
+| `src/llm/groq-client.js` | `cleanupJd`, `extractResumeFacts`, `testGroqConnection`. Never throws — always returns `{..., skipped}` or `{..., error}`. |
+| `src/llm/settings.js` | BYOK settings in `chrome.storage.local`. |
+| `src/profile/parse-markdown.js` | Pure. Markdown → atomic facts (`section`, `subsection`, `text`, `order`). |
+| `src/profile/parse-resume.js` | Pure. Validator for LLM resume-extraction output; filters off-shape facts, never throws. Emits the same shape `parse-markdown.js` does so both converge on one ingest loop. |
+| `src/import-jobs.js` | Pure. CSV (minimal RFC-4180) / JSON backup file → normalized job rows. Collects per-row errors instead of throwing, so a partly-bad file still imports. |
+| `src/readability-inject.js` | IIFE wrapper around `@mozilla/readability`. |
 
 ### Message routing
 
-Every cross-context message carries a `target` field: `'background'` or `'offscreen'` or `'sidepanel'`. Listeners filter on `target` and return `false` early if it's not theirs. Responses use `sendResponse(...)` with `return true` for async paths.
+Every cross-context message carries a `target` field: `'background'` / `'offscreen'` / `'sidepanel'`. Listeners filter on `target` and `return false` early if it's not theirs. Async paths use `sendResponse(...)` + `return true`.
+
+Background handles (all `{target: 'background', type}`): `capture`, `capture-tab`, `list`, `get`, `export-jobs`, `import-jobs`, `update-job`, `delete`, `set-status`, `ingest-profile`, `ingest-resume`, `profile-stats`, `list-profile-facts`, `clear-profile`, `recompute-match`, `recompute-all-matches`, `list-profiles`, `create-profile`, `rename-profile`, `delete-profile`, `set-default-profile`, `set-job-profile`, `get-llm-settings`, `set-llm-settings`, `clear-llm-settings`, `test-llm-connection`, `cleanup-job`.
+
+Offscreen handles: `ping`, `embed`, `parse-pdf`.
+
+Background pushes to the side panel (fire-and-forget, `.catch(() => {})`): `ingest-stage`, `ingest-progress`, `import-progress`, `recompute-progress`, `match-stale`.
 
 Canonical flows:
 
-- **Paste capture:** side panel `{target: 'background', type: 'capture', text}` → background `persistCapture` → background `{target: 'offscreen', type: 'embed', text}` → offscreen `pipeline(text)` → background writes `jobs` + `embeddings`, then `computeAndPersistMatch` if a profile exists → `sendResponse` back to side panel.
-- **Capture current tab:** side panel `{target: 'background', type: 'capture-tab'}` → background pre-injects `readability.js` into the tab → `chrome.scripting.executeScript({target: {tabId}, func: extractJobPostingFromPage})` → function runs in page's isolated world → returns `{ok, jd | error}` → background `persistCapture` (same embed + match path).
-- **Edit:** side panel `{target: 'background', type: 'update-job', id, patch}` → background re-embeds with `buildEmbedText` → updates `jobs` + `embeddings` → re-runs match.
-- **Status change:** side panel `{target: 'background', type: 'set-status', id, status}` → `setStatus` in `db.js`.
-- **Delete:** side panel `{target: 'background', type: 'delete', id}` → `deleteJob` wipes both `jobs` and `embeddings` in one transaction.
-- **Profile ingest:** side panel `{target: 'background', type: 'ingest-profile', markdown}` → background `parseProfileMarkdown` → `clearProfile` (wipe-and-reload) → for each fact, embed `"section › subsection\ntext"` via offscreen and persist to `profile_facts` + `profile_embeddings` → fire `{target: 'sidepanel', type: 'ingest-progress', done, total}` ping per fact → bump `meta.profile_version` → fire `{target: 'sidepanel', type: 'match-stale', profile_version}` → final `sendResponse({ok, count, profile_version})`.
-- **Match recompute (single):** side panel `{target: 'background', type: 'recompute-match', id}` → background reads existing JD vector from `embeddings` (no re-embed) → `computeAndPersistMatch` → updates row.
-- **Match recompute (bulk):** side panel `{target: 'background', type: 'recompute-all-matches'}` → background sweeps every JD whose `match_profile_version` ≠ current `profile_version` → emits `recompute-progress` pings → returns `{updated, total}`.
-
-The side panel never talks to the offscreen document directly — the background owns offscreen lifecycle.
+- **Paste capture:** side panel `{type: 'capture', text}` → `persistCapture` → dedup by URL → `chunkAndEmbedJD` (one `{target: 'offscreen', type: 'embed'}` round-trip *per chunk*) → `addJob` + `putJdChunks` → `computeAndPersistMatch`.
+- **Capture current tab:** side panel `{type: 'capture-tab'}` → background injects `readability.js` into **all frames** → `executeScript({target: {tabId, allFrames: true}, func: extractJobPostingFromPage})` → `pickBestExtraction` ranks results `json-ld > readability > dom-text`, then top frame (`frameId === 0`) ahead of iframes, then longest description → `persistCapture`. The all-frames sweep exists because Greenhouse/Lever/Workable embeds put the real JD in a cross-origin iframe while the host frame is chrome; the top-frame tiebreak exists so LinkedIn sidebars don't steal the capture.
+- **Edit:** `{type: 'update-job', id, patch}` → re-chunk + re-embed **only if** title / company / location / `raw_text` changed (`embedDirty`). Editing `notes`, `follow_up_at`, or `tags` must never invalidate the JD vector. A `raw_text` change also clears `cleaned_text` / `cleaned_at` / `oneliner`.
+- **Cleanup:** `{type: 'cleanup-job', id}` → `cleanupJd` → store `cleaned_text` + `oneliner` → `rechunkAndEmbed` (cleaned markdown chunks better than raw text) → `computeAndPersistMatch`.
+- **Profile ingest (markdown or resume):** both converge on `ingestFactList(facts, profileId)` → `clearProfile(profileId)` → per fact: embed `"section › subsection\ntext"`, store to `profile_facts` + `profile_embeddings`, ping `ingest-progress` → bump that profile's `version` → fire `match-stale`. The resume path adds two stages before that: `parse-pdf` in offscreen (PDF sent as base64), then `extractResumeFacts` + `validateResumeFacts`.
+- **Match recompute (bulk):** `{type: 'recompute-all-matches'}` sweeps stale rows, emitting `recompute-progress`.
+- **Import:** `{type: 'import-jobs', text, format}` → `parseImportText` → per row: dedup by URL, `addJob`, apply metadata patch, re-chunk + re-embed, `computeAndPersistMatch`, ping `import-progress`. Match payload is deliberately *not* exported/imported — it's regenerated from the active profile.
 
 ### Offscreen document lifecycle
 
-`ensureOffscreen()` in `background.js` uses `chrome.runtime.getContexts({contextTypes: ['OFFSCREEN_DOCUMENT']})` (Chrome 116+) to check for an existing doc before calling `chrome.offscreen.createDocument`. Do not swap this for the older `hasDocument()` API. A **singleton-promise guard** (`ensureOffscreenPromise`) serializes concurrent callers — otherwise two parallel requests on a cold start both see "no doc" and race on `createDocument`.
+`ensureOffscreen()` uses `chrome.runtime.getContexts({contextTypes: ['OFFSCREEN_DOCUMENT']})` (Chrome 116+) to check for an existing doc before `chrome.offscreen.createDocument`. Do not swap this for the older `hasDocument()` API. A **singleton-promise guard** (`ensureOffscreenPromise`) serializes concurrent callers — otherwise two parallel requests on a cold start both see "no doc" and race on `createDocument`.
 
 The offscreen doc persists across service-worker restarts. On the first embed it downloads `all-MiniLM-L6-v2` (~23 MB) and caches weights in the Cache API; subsequent embeds are warm (<100ms).
 
-### Match data model
+**Typed arrays don't survive `chrome.runtime` messaging reliably.** Embedding vectors cross as `Array.from(Float32Array)`; PDFs cross as base64. Keep it that way.
 
-Match data is stored on the `jobs` row (not in a separate store):
+### Data model (IndexedDB `careerpilot-lite`, v4)
+
+| Store | Key | Contents |
+|---|---|---|
+| `jobs` | `id` | Row metadata + match payload. Indexes: `timestamp`, `url` (non-unique — paste captures have `url: null`). |
+| `jd_chunk_embeddings` | `[jd_id, chunk_index]` | One row per JD chunk: `chunk_text`, `section`, `vector`, `dims`, model tags. Index: `jd_id`. |
+| `profiles` | `id` | `name`, `short_label`, `version`, `created_at`. Index: `created_at`. |
+| `profile_facts` | `id` | `profile_id`, `section`, `subsection`, `text`, `order`, model tags. Indexes: `order`, `section`, `profile_id`. |
+| `profile_embeddings` | `fact_id` | `profile_id`, `vector`, `dims`. Index: `profile_id`. |
+| `meta` | `key` | Currently just `default_profile_id`. |
+| `embeddings` | `jd_id` | **Legacy.** Whole-JD vectors from the pre-chunking era. Nothing writes it anymore; `deleteJob` still cascades it. |
+
+Migrations live in one `onupgradeneeded` with cumulative `if (oldVersion < N)` blocks — v2 added the `url` index, v3 added multi-profile (including a data backfill that moves existing facts into a synthesized "My Profile" and replaces `meta.profile_version` with per-profile `version`), v4 added `jd_chunk_embeddings`. Adding a store means bumping `DB_VERSION` and appending a block; never edit an existing block.
+
+Match payload on the `jobs` row (scalars + ids only — **no vectors in `jobs` rows**, deserialization cost on every list query is unacceptable):
 
 ```
-match_score            number | null    // mean cosine of top-K facts
-match_facts            [{fact_id, score}, ...] | null
+match_score            number | null    // section-weighted mean of per-chunk best cosines
+match_facts            [{chunk_index, chunk_text, weight, fact_id, score}] | null
 match_computed_at      number | null
-match_profile_version  string | null    // matches meta.profile_version when fresh
+match_profile_id       string | null    // which profile it was scored against
+match_profile_version  string | null    // that profile's version at compute time
+match_algo_version     string | null    // 'coverage-v2'
+profile_id             string | null    // per-JD profile override; null = use default
 ```
 
-These are scalars + ids, not vectors — so they don't violate the "no vectors in `jobs` rows" rule. The hydrated facts (with `text`, `section`, `subsection`) are looked up at read time in the `'get'` handler so the row stays small.
+The hydrated facts (with `text`, `section`, `subsection`) are joined at read time in the `'get'` handler so the stored row stays small.
+
+### Match pipeline
+
+Capture → `chunkJD` → embed each chunk → `computeMatchCoverage(chunks, {profileId})`:
+
+- For each JD chunk, find its single best-matching profile fact (`profileCosineSearchBatch`, `topKPerQuery: 1`).
+- Weight by section: `nice-to-have | preferred | bonus` → 0.75, `requirements | qualifications | must-have` → 1.25, everything else (including `null` sections from raw-text fallback) → 1.0. Nice-to-have is tested **first** so "preferred qualifications" resolves to 0.75.
+- Score = weighted mean of those per-chunk bests, bounded [0, 1].
+
+This is asymmetric on purpose: it answers "does my profile cover the JD's requirements?" rather than "what are my closest profile sentences to the JD-as-a-bag?". The side panel splits `match_facts` at `score >= 0.45` into **Strong matches** and **Gaps**; the row chip tiers at `>= 0.6` strong / `>= 0.45` mid.
+
+`computeAndPersistMatch` lazily re-chunks and re-embeds when a row has no cached chunks. That is what makes the bulk **Recompute** button silently upgrade pre-v4 rows: first hit re-embeds, subsequent recomputes are cheap.
+
+### Freshness contract
+
+A row's match is fresh iff **all** of: `match_score != null`, `match_profile_id` equals the row's active profile (`job.profile_id ?? defaultProfileId`), that profile's `version` still equals `match_profile_version`, and `match_algo_version` equals the current `MATCH_ALGO_VERSION`. Anything else renders as a strikethrough "stale" chip plus a **Recompute** banner.
+
+`MATCH_ALGO_VERSION` (`'coverage-v2'`) is **declared in two places** — `src/background.js` and `src/sidepanel.js` — and they must stay in sync. Bump it whenever the scoring changes shape, so old scores at an incomparable scale get invalidated through the existing stale/recompute UX instead of silently coexisting.
 
 ## Locked design decisions
 
-- **No rewrite, no generated prose, no body summaries.** Cover letters, application drafts, recruiter outreach, JD body TL;DRs, eval validators — all live in the parent CareerPilot project. The LLM in this project is a **filter-and-reorganize tool** for the JD body: input is `raw_text`, output is the same content arranged into clean markdown sections, with chrome and CTAs dropped. Every substantive sentence in the input must appear in the output, verbatim. **Single carve-out:** the cleanup call also returns a `oneliner` field — one short factual sentence (≤ 140 chars, role + company + 1 distinguishing detail, no marketing language) used as the list-row preview. That is the only authored sentence permitted; do not extend it to longer summaries, multi-line "TL;DR" blocks, or any other generated prose. If a feature needs the model to author or rewrite content beyond the oneliner, it belongs in the parent.
-- **LLM is optional, BYOK, and on-demand.** Capture is deterministic-only — it never calls the LLM. Cleanup runs only when the user clicks "Clean up JD ✨" on a row, and only when (a) a key is saved and (b) the enable toggle is on. Missing key, network error, or provider failure surface as a status message; the row is unchanged. Provider host(s) for the LLM go in `connect-src`; that exception is for the cleanup endpoint only and does not open the door to rewrite/summary traffic.
-- **Match score is mean cosine of top-K profile facts.** No JD chunking, no asymmetric matching, no learned weights. The simplicity is the feature. Extensions go in new modules; don't add complexity to `src/match.js` itself.
-- **Generic extractor is the primary capture path.** `src/adapters/json-ld.js` + Readability + DOM-text fallback covers the long tail. Site-specific adapters are *refinements* (trim boilerplate, handle shadow DOM, pull richer metadata) — not the first line of coverage. Adding a per-site module requires justification: "the generic path produces unacceptable noise for this site because X."
+- **No rewrite, no generated prose, no body summaries.** See the charter above. If a feature needs the model to author or rewrite content beyond the `oneliner`, it belongs in the parent project.
+- **Capture is deterministic-only.** It never calls the LLM. Cleanup runs only on an explicit click, and only when a key is saved *and* the enable toggle is on. Missing key, network error, or provider failure surface as a status message; the row is unchanged.
+- **LLM failures never throw.** `groq-client.js` returns `{skipped}` or `{error}`. Keep that contract — the handlers rely on it to leave rows untouched.
+- **The API key lives in `chrome.storage.local`, never IndexedDB.** IDB is the backup/export surface for captured JDs; credentials do not belong there, and it makes "Clear settings" a single delete.
+- **Match scoring stays simple.** Section-weighted per-chunk coverage, no learned weights, no re-ranking model. Extensions go in new modules; don't grow `match-coverage.js` or `match.js`.
+- **Generic extractor is the primary capture path.** Site-specific adapters are *refinements* (trim boilerplate, handle shadow DOM, pull richer metadata) — not the first line of coverage. Adding a per-site module requires justification: "the generic path produces unacceptable noise for this site because X."
 - **Embedding versioning is mandatory.** Every vector carries `{model_id, model_version}` (currently `Xenova/all-MiniLM-L6-v2` + `q-v1`). Swapping models requires a reindex; tagging makes that detectable instead of silent corruption.
-- **IndexedDB layout.** Stores: `jobs` (row metadata + match payload), `embeddings` (Float32Array per JD), `profile_facts`, `profile_embeddings`, `meta` (single key/value, currently `profile_version`). Do **not** co-locate vectors in `jobs` rows — deserialization cost on every list query is unacceptable.
 - **Model weights live in the Cache API**, not IndexedDB. Blobs belong in Cache API.
-- **`profile_version` is the staleness contract.** Set on every successful `ingest-profile`; cleared on `clear-profile`. The side panel compares `job.match_profile_version` against the current `meta.profile_version` to decide whether a chip is fresh, stale, or never-computed.
+- **Notes / tags / follow-up dates are metadata, not JD content.** They must never enter the embed input or trigger re-embedding.
 - **`<all_urls>` is dev-mode.** Same as the parent project — fine for dogfooding, must move to `optional_host_permissions` + `chrome.permissions.request({origins: [currentOrigin]})` before any Chrome Web Store submission.
-
-## Development workflow
-
-**esbuild-based.** Source lives in `src/` and `manifest.json` at the repo root. The build emits a flat `dist/` that Chrome loads as the unpacked extension.
-
-```bash
-npm install          # first time only
-npm run build        # one-shot build
-npm run watch        # rebuild on file changes (recommended during dev)
-npm test             # runs tests/parse-markdown.test.js
-```
-
-`build.mjs` runs:
-1. **ESM pass** for extension pages: `src/background.js`, `src/offscreen.js`, `src/sidepanel.js` → `dist/*.js`.
-2. **IIFE pass** for `src/readability-inject.js` → `dist/readability.js` (must be IIFE, not ESM, because `chrome.scripting.executeScript({files: [...]})` expects a classic script that mutates `globalThis`).
-
-`copyStatic()` wipes `dist/`, copies the HTML files + `manifest.json`, and copies ONNX Runtime Web WASM files from `node_modules/onnxruntime-web/dist/` to `dist/wasm/`. `src/embed.js` points `env.backends.onnx.wasm.wasmPaths` at `chrome.runtime.getURL('wasm/')` so ORT resolves its WASM locally rather than hitting a CDN.
-
-### Loading the extension
-
-1. Run `npm run build` (or `npm run watch`).
-2. `chrome://extensions` → enable Developer mode → **Load unpacked** → select `dist/`.
-3. Pin the toolbar icon; clicking it opens the side panel.
-4. After rebuilds, click the reload icon on the extension's card in `chrome://extensions`.
-
-This extension uses its own IndexedDB database (`careerpilot-lite`) and its own extension ID, so it can run side-by-side with the parent CareerPilot extension without sharing state.
-
-**Heads up:** IndexedDB is scoped to the extension origin (`chrome-extension://<id>/`). `npm run build` only wipes `dist/` — your captured JDs and ingested profile survive rebuilds. Clicking **Remove** on the extension card is what would wipe the database. "Clear browsing data" in Chrome does **not** touch extension IndexedDB.
-
-### Inspecting the three contexts
-
-Each has its own DevTools window:
-
-- **Side panel**: right-click inside the panel → Inspect.
-- **Service worker**: extension card → click the **service worker** link. Watch here for `chrome.scripting.executeScript` errors and match-compute logs.
-- **Offscreen document**: extension card → click **offscreen.html** (appears only after the first `ensureOffscreen` call). Watch here for `[embed fetch] FAILED <url>` logs on CSP misses.
-- **Injected extractor**: no separate DevTools — the extractor runs in the target page's isolated world. If it throws, the error surfaces in `chrome.scripting.executeScript`'s return value, which background.js propagates to the side panel.
-
-### Smoke test
-
-1. Open the side panel from the toolbar icon. Open the **Profile** drawer (👤). Upload `profile.md` (root of repo) or paste markdown → progress bar fills → facts list renders grouped by section.
-2. Navigate to a job page (Greenhouse, Lever, Ashby, branded careers pages). Click **Capture current tab**.
-3. First capture: expect `cold-start ~3000–8000ms · embed <200ms` (one-time model download). Subsequent captures: no cold-start, `embed <100ms`.
-4. Captured JD appears with title, status picker, **a colored match-score chip**, and delete button.
-5. Click the row → detail view shows the JD body and a **Match section** with a big % score and top matching facts grouped by `section › subsection`.
-6. Re-ingest a slightly edited profile → existing chips switch to a strikethrough "stale" state and a banner offers **Recompute**. Click it → all rows refresh.
-7. Click **Recompute match** in the detail view of a single JD → just that one updates.
-8. Negative tests: capture on a non-job page (e.g. google.com) → fails cleanly with `no JobPosting schema + DOM text too short`. Clear profile → all chips disappear; detail view shows "Ingest your profile to see match scores."
-
-If the first capture fails with "Failed to fetch", check the offscreen DevTools console for `[embed fetch] FAILED <url>` — that surfaces the exact CDN URL CSP blocked, and the fix is usually adding a host to `connect-src` in `manifest.json`.
-
-If capture fails with "Cannot access contents of the page", the `<all_urls>` grant wasn't accepted at install; reload the extension and accept the prompt.
 
 ## Permissions
 
 `manifest.json` declares:
 
 - **API permissions:** `sidePanel`, `offscreen`, `storage`, `scripting`.
-- **Host permissions:** `<all_urls>` — required for the generic extractor to reach any job page. Dev-mode tradeoff; will migrate to `optional_host_permissions` + per-origin `chrome.permissions.request()` before Chrome Web Store submission.
-- **CSP** `connect-src`: `huggingface.co` + `*.huggingface.co` + `*.hf.co` + `*.xethub.hf.co` + `cdn-lfs*.huggingface.co` (required for the Xet CDN redirects on first model download), plus `api.groq.com` for the on-demand cleanup call. The LLM provider host exception is **for the cleanup endpoint only**. Do not list any host whose only purpose would be a rewrite, summary, eval, or chat-completion-as-prose call; that traffic does not belong here.
+- **Host permissions:** `<all_urls>` — required for the generic extractor to reach any job page.
+- **CSP `connect-src`:** `huggingface.co` + `*.huggingface.co` + `*.hf.co` + `*.xethub.hf.co` + `cdn-lfs*.huggingface.co` (required for the Xet CDN redirects on first model download), plus `api.groq.com`. The LLM provider host exception is **for the cleanup and resume-parsing endpoints only**. Do not list any host whose only purpose would be a rewrite, summary, eval, or chat-completion-as-prose call.
+
+## Development workflow
+
+### Loading the extension
+
+1. `npm run build` (or `npm run watch`).
+2. `chrome://extensions` → enable Developer mode → **Load unpacked** → select `dist/`.
+3. Pin the toolbar icon; clicking it opens the side panel.
+4. After rebuilds, click the reload icon on the extension's card.
+
+This extension uses its own IndexedDB database (`careerpilot-lite`) and its own extension ID, so it runs side-by-side with the parent CareerPilot extension without sharing state.
+
+**Heads up:** IndexedDB is scoped to the extension origin. `npm run build` only wipes `dist/` — captured JDs and ingested profiles survive rebuilds. Clicking **Remove** on the extension card is what wipes the database. "Clear browsing data" does **not** touch extension IndexedDB.
+
+### Inspecting the three contexts
+
+Each has its own DevTools window:
+
+- **Side panel**: right-click inside the panel → Inspect.
+- **Service worker**: extension card → click the **service worker** link. Watch here for `chrome.scripting.executeScript` errors, match-compute logs, and `[ingest-resume] dropped N malformed facts`.
+- **Offscreen document**: extension card → click **offscreen.html** (appears only after the first `ensureOffscreen` call). Watch here for `[embed fetch] FAILED <url>` on CSP misses.
+- **Injected extractor**: no separate DevTools — it runs in the target page's isolated world. Errors surface in `executeScript`'s return value, which `background.js` propagates to the side panel.
+
+### Smoke test
+
+1. Open the side panel. Open the **Profile** drawer (👤), create a profile, and load it — paste markdown (see `atomic_facts.md` for the expected shape) or upload a resume PDF (requires a Groq key). Progress bar fills; facts render grouped by section.
+2. Navigate to a job page (Greenhouse, Lever, Ashby, an iframe-embedded board) → **Capture current tab**.
+3. First capture: expect `cold-start ~3000–8000ms` (one-time model download). Subsequent captures: sub-second, one embed per chunk.
+4. Captured JD appears with title, status picker, a colored match chip, and delete button.
+5. Click the row → detail view shows a big % score and JD chunks split into **Strong matches** / **Gaps**.
+6. Click **Clean up JD ✨** → body switches to cleaned markdown, row preview becomes the oneliner, and the score refreshes off the better-structured chunks.
+7. Re-ingest an edited profile, or switch the default profile → chips go strikethrough-stale and the **Recompute** banner appears. Click it → all rows refresh.
+8. Export JSON from the Profile drawer, then re-import it → rows dedup by URL, re-embed, and rescore.
+9. Negative tests: capture on a non-job page (e.g. google.com) → fails cleanly with `no JobPosting schema + DOM text too short`. Delete all profiles → chips disappear; detail view shows "Add a profile to see match scores."
+
+If the first capture fails with "Failed to fetch", check the offscreen console for `[embed fetch] FAILED <url>` — that surfaces the exact URL CSP blocked, and the fix is usually adding a host to `connect-src`. If capture fails with "Cannot access contents of the page", the `<all_urls>` grant wasn't accepted at install; reload the extension and accept the prompt.
 
 ## Relation to the parent CareerPilot project
 
-This project is a sibling to `../CareerPilot`, not a fork. It was carved out so the tracker + match loop can be dogfooded independently of the rewrite workstream. If you need anything that produces new content the user reads (rewrites, cover letters, summaries / TL;DRs, citations rendered into application copy, eval harness, prompt-tuning loops), open the parent project. If you need anything tracker-, capture-, or match-shaped, work here — including LLM-assisted **cleanup** of captured JDs (filter and reorganize, never paraphrase or summarize).
-
-When in doubt: does the feature ask the model to **filter and reorganize** content the user already captured, or to **author** new content (paraphrases, summaries, drafts)? Filter-and-reorganize → here (gated behind BYOK + on-demand). Author → parent.
+This project is a sibling to `../CareerPilot`, not a fork. It was carved out so the tracker + match loop can be dogfooded independently of the rewrite workstream. If you need anything that produces new content the user reads (rewrites, cover letters, summaries / TL;DRs, citations rendered into application copy, eval harness, prompt-tuning loops), open the parent project. If you need anything tracker-, capture-, or match-shaped, work here — including LLM-assisted cleanup of captured JDs.
