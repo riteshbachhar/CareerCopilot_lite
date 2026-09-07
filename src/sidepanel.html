@@ -299,6 +299,13 @@
       .status-timeline .stage[data-status="archived"]     { color: var(--status-archived); }
       .status-timeline .when { opacity: 0.6; font-size: 10px; }
 
+      /* ---------- Card date (deadline > posted > captured) ---------- */
+      /* A deadline is the only one of the three that can cost the user
+         something by going unread, so it's the only one that gets colour. */
+      .job-date.deadline { color: var(--status-rejected); opacity: 0.9; }
+      .job-date.deadline.urgent { font-weight: 600; opacity: 1; }
+      .job-date.deadline.past { text-decoration: line-through; opacity: 0.55; }
+
       /* ---------- Structured-field chips (detail) ---------- */
       .field-chips {
         display: flex;

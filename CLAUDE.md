@@ -8,7 +8,7 @@ Career Copilot Lite is a stripped-down sibling of the full Career Copilot projec
 
 The LLM here is **optional, BYOK, and on-demand**, and is permitted for exactly two jobs:
 
-1. **JD body cleanup** — reorganize the captured `raw_text` into proper markdown sections, dropping CTAs / cookie banners / boilerplate, while preserving every substantive sentence verbatim. As a side product of that same call it returns one short factual `oneliner` (≤ 140 chars, role + company + 1 distinguishing detail, no marketing prose) used as the list-row preview. **That one-liner is the only authored sentence this project permits.**
+1. **JD body cleanup** — reorganize the captured `raw_text` into proper markdown sections, dropping CTAs / cookie banners / boilerplate, while preserving every substantive sentence verbatim. As side products of that same call it returns one short factual `oneliner` (≤ 140 chars, role + company + 1 distinguishing detail, no marketing prose) used as the list-row preview, plus the application `deadline` and `posted_date` when the JD states them outright. **That one-liner is the only authored sentence this project permits.** The dates are extraction, not authoring: the prompt forbids computing a date from a relative phrase ("posted 3 days ago") and `sanitizeIsoDate` in `groq-client.js` drops anything that isn't a real calendar date within [2000, current year + 2].
 2. **Resume parsing** at profile-upload time — split an uploaded CV into atomic `{section, subsection, text}` facts, where `text` is verbatim from the resume.
 
 Out of scope (these are the reasons this project exists separately from the parent):
@@ -30,7 +30,7 @@ node --test --test-name-pattern="section weight" tests/match-coverage.test.js
 npm run clean                        # rm -rf dist
 ```
 
-There is no linter or typechecker configured. Tests cover the pure functions only (`chunk-jd`, `match-coverage`, `parse-markdown`, `parse-resume`, `import-jobs`) — anything touching `chrome.*` or IndexedDB is verified by the manual smoke test below.
+There is no linter or typechecker configured. Tests cover the pure functions only (`chunk-jd`, `match-coverage`, `parse-markdown`, `parse-resume`, `import-jobs`, and `sanitizeIsoDate` from `llm/groq-client`) — anything touching `chrome.*` or IndexedDB is verified by the manual smoke test below.
 
 `build.mjs` runs three things:
 1. **ESM pass** for extension pages: `src/background.js`, `src/offscreen.js`, `src/sidepanel.js` → `dist/*.js`.
@@ -74,10 +74,11 @@ Background pushes to the side panel (fire-and-forget, `.catch(() => {})`): `inge
 
 Canonical flows:
 
-- **Paste capture:** side panel `{type: 'capture', text}` → `persistCapture` → dedup by URL → `chunkAndEmbedJD` (one `{target: 'offscreen', type: 'embed'}` round-trip *per chunk*) → `addJob` + `putJdChunks` → `computeAndPersistMatch`.
+- **Paste capture:** side panel `{type: 'capture', text}` → `persistCapture` → dedup by URL → `cleanupJd` (see below) → `chunkAndEmbedJD` (one `{target: 'offscreen', type: 'embed'}` round-trip *per chunk*) → `addJob` + `putJdChunks` → `computeAndPersistMatch`.
+- **Capture-time cleanup:** `persistCapture` runs `cleanupJd` on the extracted text before chunking, after the dedup early-return (a deduped capture costs no LLM call). If it returns text, the row is stored with `cleaned_text` / `cleaned_at` / `oneliner` already set (plus any extracted dates folded into `structured_fields` by `withCleanupDates`, where deterministic JSON-LD `date_posted` / `valid_through` always win over the LLM's) and the chunks are cut from the cleaned markdown — so there is no second embed pass. If it returns `{skipped}` or `{error}`, the row falls through to the raw-text path unchanged, and the outcome rides back to the side panel on the capture response as `cleanup: {applied, skipped, error, latencyMs}`. The **Clean up JD ✨** button remains the manual retry for rows that landed raw. Bulk import does *not* go through `persistCapture` and stays LLM-free.
 - **Capture current tab:** side panel `{type: 'capture-tab'}` → background injects `readability.js` into **all frames** → `executeScript({target: {tabId, allFrames: true}, func: extractJobPostingFromPage})` → `pickBestExtraction` ranks results `json-ld > readability > dom-text`, then top frame (`frameId === 0`) ahead of iframes, then longest description → `persistCapture`. The all-frames sweep exists because Greenhouse/Lever/Workable embeds put the real JD in a cross-origin iframe while the host frame is chrome; the top-frame tiebreak exists so LinkedIn sidebars don't steal the capture.
 - **Edit:** `{type: 'update-job', id, patch}` → re-chunk + re-embed **only if** title / company / location / `raw_text` changed (`embedDirty`). Editing `notes`, `follow_up_at`, or `tags` must never invalidate the JD vector. A `raw_text` change also clears `cleaned_text` / `cleaned_at` / `oneliner`.
-- **Cleanup:** `{type: 'cleanup-job', id}` → `cleanupJd` → store `cleaned_text` + `oneliner` → `rechunkAndEmbed` (cleaned markdown chunks better than raw text) → `computeAndPersistMatch`.
+- **Cleanup:** `{type: 'cleanup-job', id}` → `cleanupJd` → store `cleaned_text` + `oneliner` + `withCleanupDates(structured_fields, out)` → `rechunkAndEmbed` (cleaned markdown chunks better than raw text) → `computeAndPersistMatch`.
 - **Profile ingest (markdown or resume):** both converge on `ingestFactList(facts, profileId)` → `clearProfile(profileId)` → per fact: embed `"section › subsection\ntext"`, store to `profile_facts` + `profile_embeddings`, ping `ingest-progress` → bump that profile's `version` → fire `match-stale`. The resume path adds two stages before that: `parse-pdf` in offscreen (PDF sent as base64), then `extractResumeFacts` + `validateResumeFacts`.
 - **Match recompute (bulk):** `{type: 'recompute-all-matches'}` sweeps stale rows, emitting `recompute-progress`.
 - **Import:** `{type: 'import-jobs', text, format}` → `parseImportText` → per row: dedup by URL, `addJob`, apply metadata patch, re-chunk + re-embed, `computeAndPersistMatch`, ping `import-progress`. Match payload is deliberately *not* exported/imported — it's regenerated from the active profile.
@@ -139,7 +140,7 @@ A row's match is fresh iff **all** of: `match_score != null`, `match_profile_id`
 ## Locked design decisions
 
 - **No rewrite, no generated prose, no body summaries.** See the charter above. If a feature needs the model to author or rewrite content beyond the `oneliner`, it belongs in the parent project.
-- **Capture is deterministic-only.** It never calls the LLM. Cleanup runs only on an explicit click, and only when a key is saved *and* the enable toggle is on. Missing key, network error, or provider failure surface as a status message; the row is unchanged.
+- **Extraction is deterministic-only; cleanup is best-effort on top of it.** The page-extraction pipeline (JSON-LD → Readability → DOM text) never calls the LLM — what gets captured does not depend on a provider being up. Cleanup then runs automatically at capture *and* on the explicit button, in both cases only when a key is saved *and* the enable toggle is on. A missing key, network error, or provider failure must always degrade to the raw-text row plus a status message, never to a failed capture.
 - **LLM failures never throw.** `groq-client.js` returns `{skipped}` or `{error}`. Keep that contract — the handlers rely on it to leave rows untouched.
 - **The API key lives in `chrome.storage.local`, never IndexedDB.** IDB is the backup/export surface for captured JDs; credentials do not belong there, and it makes "Clear settings" a single delete.
 - **Match scoring stays simple.** Section-weighted per-chunk coverage, no learned weights, no re-ranking model. Extensions go in new modules; don't grow `match-coverage.js` or `match.js`.

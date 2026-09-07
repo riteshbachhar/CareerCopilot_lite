@@ -227,6 +227,69 @@ function renderStatusTimeline(job) {
   return `<div class="status-timeline">${stages}</div>`;
 }
 
+// "YYYY-MM-DD" is what the cleanup pass emits and what most JSON-LD
+// datePosted/validThrough values look like. `new Date("2026-03-14")` parses
+// as UTC midnight, which renders as the 13th anywhere west of Greenwich —
+// so build the date-only case in local time and leave full timestamps to
+// the normal parser.
+function parseDateOnly(v) {
+  if (typeof v !== 'string' || !v.trim()) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v.trim());
+  const d = m
+    ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+    : new Date(v);
+  return isNaN(d) ? null : d;
+}
+
+function formatDayMonth(d) {
+  const opts = { month: 'short', day: 'numeric' };
+  if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString(undefined, opts);
+}
+
+// Whole calendar days from today to `d`, local time — so "closes today"
+// means today, not "within 24 hours".
+function daysUntil(d) {
+  const startOfDay = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+  return Math.round((startOfDay(d) - startOfDay(new Date())) / 86_400_000);
+}
+
+// The date to show on a job card, in the order a user actually cares about:
+// an application deadline beats a posted date, which beats "when I saved
+// this". Deadline and posted come from JSON-LD when the page published them
+// and from the cleanup pass otherwise; `timestamp` is always set, so this
+// only returns null for a malformed row.
+function pickJobDate(job) {
+  const sf = job.structured_fields ?? {};
+  const deadline = parseDateOnly(sf.valid_through);
+  if (deadline) {
+    const days = daysUntil(deadline);
+    if (days < 0) {
+      return { label: `closed ${formatDayMonth(deadline)}`, kind: 'deadline', past: true };
+    }
+    return {
+      label: days === 0 ? 'closes today' : `closes ${formatDayMonth(deadline)}`,
+      kind: 'deadline',
+      urgent: days <= 7,
+    };
+  }
+  const posted = parseDateOnly(sf.date_posted);
+  if (posted) return { label: `posted ${formatDayMonth(posted)}`, kind: 'posted' };
+  if (job.timestamp) {
+    return { label: `captured ${formatDayMonth(new Date(job.timestamp))}`, kind: 'captured' };
+  }
+  return null;
+}
+
+function renderJobDate(job) {
+  const d = pickJobDate(job);
+  if (!d) return '';
+  const cls = ['job-date', d.kind, d.urgent ? 'urgent' : '', d.past ? 'past' : '']
+    .filter(Boolean)
+    .join(' ');
+  return `<span class="${cls}">${escapeHtml(d.label)}</span>`;
+}
+
 function formatSalaryChip(salary) {
   if (!salary) return null;
   const cur = salary.currency ?? '';
@@ -255,9 +318,17 @@ function renderFieldChips(job) {
   if (sf.seniority) chips.push(sf.seniority);
   const salary = formatSalaryChip(sf.salary);
   if (salary) chips.push(salary);
-  if (sf.date_posted) {
-    const d = new Date(sf.date_posted);
-    if (!isNaN(d)) chips.push(`posted ${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`);
+  // date_posted / valid_through are rendered by renderJobDate in the header;
+  // repeating the winning one as a chip is noise. Show posted here only when
+  // a deadline outranked it up top.
+  const posted = parseDateOnly(sf.date_posted);
+  if (posted && parseDateOnly(sf.valid_through)) {
+    chips.push(`posted ${formatDayMonth(posted)}`);
+  }
+  // The header shows the most useful date; keep capture time reachable in
+  // the detail view whenever a JD-supplied date displaced it.
+  if (job.timestamp && pickJobDate(job)?.kind !== 'captured') {
+    chips.push(`captured ${formatDayMonth(new Date(job.timestamp))}`);
   }
   if (!chips.length) return '';
   return `<div class="field-chips">${chips.map((c) => `<span class="field-chip">${escapeHtml(c)}</span>`).join('')}</div>`;
@@ -494,7 +565,6 @@ function renderEditForm(job) {
 }
 
 function renderRow(job) {
-  const date = job.timestamp ? new Date(job.timestamp).toLocaleString() : '';
   const seniority = job.structured_fields?.seniority;
   const source = job.structured_fields?.source;
   const location = job.structured_fields?.location;
@@ -504,7 +574,7 @@ function renderRow(job) {
   return `
     <div class="row" data-job-id="${escapeHtml(jobId)}" data-status="${escapeHtml(status)}">
       <div class="title">${escapeHtml(job.title ?? '(untitled)')}</div>
-      <div class="meta">${escapeHtml(job.company ?? '')}${job.company ? ' · ' : ''}${escapeHtml(date)}</div>
+      <div class="meta">${escapeHtml(job.company ?? '')}${job.company ? ' · ' : ''}${renderJobDate(job)}</div>
       ${tags ? `<div class="meta">${escapeHtml(tags)}</div>` : ''}
       ${renderTagStrip(job)}
       <div class="preview">${escapeHtml(job.preview ?? '')}</div>
@@ -787,14 +857,17 @@ function renderDetail() {
   const job = currentJobFull;
   const company = job.company ?? '';
   const location = job.structured_fields?.location ?? '';
-  const date = job.timestamp ? new Date(job.timestamp).toLocaleString() : '';
   const status = job.status ?? DEFAULT_STATUS;
-  const metaLine = [company, location, date].filter(Boolean).join(' · ');
+  // renderJobDate returns markup, so it can't ride inside the escaped
+  // metaLine string — join the plain parts first, then append it.
+  const metaText = [company, location].filter(Boolean).join(' · ');
+  const dateHtml = renderJobDate(job);
+  const metaLine = `${escapeHtml(metaText)}${metaText && dateHtml ? ' · ' : ''}${dateHtml}`;
 
   if (isEditMode) {
     detailContent.innerHTML = `
       <div class="detail-header" data-status="${escapeHtml(status)}">
-        <div class="detail-meta">${escapeHtml(metaLine)}</div>
+        <div class="detail-meta">${metaLine}</div>
       </div>
       ${renderEditForm(job)}
     `;
@@ -806,7 +879,7 @@ function renderDetail() {
     : '';
   detailContent.innerHTML = `
     <div class="detail-header" data-status="${escapeHtml(status)}">
-      <div class="detail-meta">${escapeHtml(metaLine)}</div>
+      <div class="detail-meta">${metaLine}</div>
       ${renderJobUrlLink(job)}
       ${renderFieldChips(job)}
       <div class="detail-actions">
@@ -1457,7 +1530,12 @@ async function handleRecomputeMatchClick() {
 async function handleCapture(type, extraArgs, btn, status) {
   btn.disabled = true;
   status.className = 'status';
-  status.textContent = type === 'capture-tab' ? 'reading tab…' : 'embedding…';
+  // Capture now runs an LLM cleanup pass before embedding when a key is
+  // saved and the toggle is on, which adds a couple of seconds — say so
+  // rather than leaving the button dead under a stale "embedding…".
+  const cleaningNote = llmEnabledHasKey ? ' + cleaning up' : '';
+  status.textContent =
+    type === 'capture-tab' ? `reading tab${cleaningNote}…` : `embedding${cleaningNote}…`;
   const t0 = performance.now();
   try {
     const resp = await send(type, extraArgs);
@@ -1473,7 +1551,14 @@ async function handleCapture(type, extraArgs, btn, status) {
     }
     const coldNote = resp.coldStartMs ? ` · cold-start ${fmt(resp.coldStartMs)}ms` : '';
     const titleNote = resp.title ? ` · ${resp.title}` : '';
-    status.textContent = `captured${titleNote} · embed ${fmt(resp.embedMs)}ms · total ${fmt(totalMs)}ms${coldNote}`;
+    // A cleanup that was skipped for no-key / disabled is the normal
+    // LLM-less path and gets no note; a real failure is worth naming, since
+    // the row is still there and the Clean up button will retry it.
+    const c = resp.cleanup;
+    let cleanNote = '';
+    if (c?.applied) cleanNote = ` · cleaned ${fmt(c.latencyMs)}ms`;
+    else if (c?.error) cleanNote = ` · cleanup failed (${c.error}) — saved raw`;
+    status.textContent = `captured${titleNote} · embed ${fmt(resp.embedMs)}ms · total ${fmt(totalMs)}ms${coldNote}${cleanNote}`;
     if (type === 'capture') paste.value = '';
     await refreshJobs();
   } catch (err) {

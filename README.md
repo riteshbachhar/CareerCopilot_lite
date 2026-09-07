@@ -9,7 +9,7 @@ Capture a job posting from any tab, embed it locally, and score it against your 
 - **Capture** any job page via the toolbar icon — generic JSON-LD extractor with Readability + DOM-text fallbacks. Works on Greenhouse, Lever, Ashby, Workable, Interfolio, and most branded ATSes.
 - **Track** captured jobs with status (interested / applied / interviewing / offer / rejected / archived), filters, tags, notes, and follow-up dates.
 - **Match** each JD against your ingested profile using local sentence embeddings (`all-MiniLM-L6-v2`, 384-dim, runs in-browser via ONNX Runtime Web). The JD is split into atomic requirement-shaped chunks and each chunk is scored against the profile; the score is the mean of per-chunk best matches. Detail view groups by JD chunk into Strong matches and Gaps so you can see what the profile covers and what it doesn't.
-- **Enhance** (optional, BYOK): one click runs the captured `raw_text` through Groq, gets back a cleaned markdown version of the body plus a short factual one-liner used as the row preview. The original `raw_text` is preserved alongside the cleaned text — both are viewable.
+- **Enhance** (optional, BYOK): with a key saved and the toggle on, every capture runs its `raw_text` through Groq automatically and gets back a cleaned markdown version of the body, a short factual one-liner used as the row preview, and the application deadline / posted date when the JD spells them out. If the call fails or no key is set, the raw capture is saved as-is and a **Clean up JD ✨** button in the detail view retries on demand. The original `raw_text` is always preserved alongside the cleaned text — both are viewable.
 
 ## Tech stack
 
@@ -68,11 +68,11 @@ Two ways:
 - **Capture current tab** — navigate to a job posting and click the button in the side panel. The generic JSON-LD + Readability + DOM-text extractor handles Greenhouse, Lever, Ashby, Workable, LinkedIn, and most branded ATSes including Greenhouse-embedded boards.
 - **Paste JD text** — paste the body into the textbox and submit. Useful when extraction fails on an oddly-structured page.
 
-Each capture chunks the JD into atomic requirement-shaped pieces, embeds each chunk locally, scores it against your profile, and stores the row. First capture is ~3–8s (one-time model warm-up); subsequent captures are sub-second.
+Each capture cleans up the JD via Groq (if a key is set and the toggle is on), chunks it into atomic requirement-shaped pieces, embeds each chunk locally, scores it against your profile, and stores the row. First capture is ~3–8s (one-time model warm-up); subsequent captures are sub-second, plus ~1–3s for the cleanup call. Cleanup failures never fail the capture — the row is saved raw and the status line says so.
 
 ### 4. Read the match
 
-Each row shows a colored chip: green = strong, yellow = medium, red = weak / no profile match. Click a row to open the detail view, which groups by JD chunk:
+Each row shows a date — the application deadline if the posting has one (red, bold when it's within a week, struck through once it's passed), otherwise the posted date, otherwise when you captured it. It also shows a colored chip: green = strong, yellow = medium, red = weak / no profile match. Click a row to open the detail view, which groups by JD chunk:
 
 - **Strong matches** — JD chunks with a confident profile fact behind them, with the matched fact shown.
 - **Gaps** — JD chunks that have no strong profile match. These are what to address in a cover letter or skill build-up.
@@ -88,7 +88,7 @@ The score itself is a section-weighted mean of per-chunk best matches: requireme
 
 ### 6. (Optional) Clean up the JD
 
-In the detail view, click **Clean up JD ✨**. Groq returns a reorganized markdown version of the body (Responsibilities / Requirements / Benefits sections, no CTAs) plus a short factual one-liner that becomes the row preview. The original `raw_text` is preserved alongside the cleaned text — both are viewable. After cleanup, the row is automatically re-chunked and rescored against the now-better-structured body.
+Capture does this automatically when a key is set, so you normally only need this to retry a row that was captured before you added a key, or one whose cleanup call failed. In the detail view, click **Clean up JD ✨**. Groq returns a reorganized markdown version of the body (Responsibilities / Requirements / Benefits sections, no CTAs) plus a short factual one-liner that becomes the row preview. The original `raw_text` is preserved alongside the cleaned text — both are viewable. After cleanup, the row is automatically re-chunked and rescored against the now-better-structured body.
 
 ### Troubleshooting
 

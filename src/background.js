@@ -262,6 +262,17 @@ async function computeAndPersistMatch(jdId, profileIdOverride) {
   };
 }
 
+// Fold cleanup-extracted dates into structured_fields. The deterministic
+// JSON-LD values win outright — the LLM pass only fills a field the page's
+// own schema.org markup left empty, and reuses the existing `date_posted` /
+// `valid_through` keys rather than opening a second source of truth.
+function withCleanupDates(sf, cleanup) {
+  const out = { ...(sf ?? {}) };
+  if (!out.date_posted && cleanup?.datePosted) out.date_posted = cleanup.datePosted;
+  if (!out.valid_through && cleanup?.deadline) out.valid_through = cleanup.deadline;
+  return out;
+}
+
 async function persistCapture({
   url,
   title,
@@ -289,20 +300,37 @@ async function persistCapture({
     }
   }
 
+  // Capture-time cleanup. Extraction stays deterministic — this runs after
+  // the page text is already in hand, and cleanupJd never throws: a missing
+  // key, a disabled toggle, a timeout, or a provider error all come back as
+  // {cleanedText: null, skipped|error}, and we fall through to storing the
+  // raw text exactly as an LLM-less capture would. Doing it here rather than
+  // on a later click means the first chunk+embed pass already runs on the
+  // structured markdown, so there is no re-embed to pay for afterwards.
+  const settings = await getLlmSettings();
+  const cleanup = await cleanupJd({ rawText: text, settings });
+  const cleanedText = cleanup.cleanedText ?? null;
+
   const { chunkRows, coldStartMs, embedMs, modelId, modelVersion } =
-    await chunkAndEmbedJD({ raw_text: text, cleaned_text: null });
+    await chunkAndEmbedJD({ raw_text: text, cleaned_text: cleanedText });
 
   const row = await addJob({
     url: url ?? null,
     title: title ?? null,
     company: company ?? null,
     raw_text: text,
-    structured_fields: {
-      ...(structured_fields ?? {}),
-      source: source ?? 'paste',
-      location: location ?? null,
-      seniority: inferSeniority(title),
-    },
+    cleaned_text: cleanedText,
+    cleaned_at: cleanedText ? Date.now() : null,
+    oneliner: cleanedText ? (cleanup.oneliner ?? null) : null,
+    structured_fields: withCleanupDates(
+      {
+        ...(structured_fields ?? {}),
+        source: source ?? 'paste',
+        location: location ?? null,
+        seniority: inferSeniority(title),
+      },
+      cleanup,
+    ),
     model_id: modelId,
     model_version: modelVersion,
   });
@@ -317,6 +345,15 @@ async function persistCapture({
     embedMs,
     title: row.title,
     company: row.company,
+    // Surfaced so the side panel can say whether the row landed cleaned or
+    // raw, and why. `skipped` is the expected no-key / disabled path, not an
+    // error worth shouting about.
+    cleanup: {
+      applied: Boolean(cleanedText),
+      skipped: cleanup.skipped ?? null,
+      error: cleanup.error ?? null,
+      latencyMs: cleanup.latencyMs ?? null,
+    },
   };
 }
 
@@ -1179,6 +1216,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           cleaned_text: out.cleanedText,
           cleaned_at: Date.now(),
           oneliner: out.oneliner ?? null,
+          structured_fields: withCleanupDates(row.structured_fields, out),
         });
         // The cleaned markdown's section/bullet structure produces better-
         // shaped chunks than the raw_text fallback path. Re-chunk + rescore

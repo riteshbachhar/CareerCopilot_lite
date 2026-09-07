@@ -3,7 +3,11 @@
 // or invent content. Per CLAUDE.md, the cleanup also returns a single
 // short factual one-line role summary used as the list-row preview; this
 // is the only authored prose this project permits, and it must stay
-// factual and ≤140 chars.
+// factual and ≤140 chars. It also lifts the application deadline and
+// posted date when the JD states them outright — extraction, not
+// inference: the model is told to return null rather than compute a date
+// from a relative phrase, and sanitizeIsoDate drops anything that isn't a
+// real calendar date in a plausible range.
 //
 // Failure modes (all return {cleanedText: null, error|skipped}, never throw):
 //   - no key / disabled       → skipped: 'no-key' | 'disabled'
@@ -37,10 +41,20 @@ OUTPUT 2 — "oneliner": a single factual sentence describing the role, used as 
 - NO marketing language ("amazing opportunity", "fast-growing", "join our team", "we're looking for"). NO superlatives. NO recruiter prose.
 - If the input is too sparse to identify the role + a distinguishing detail, return null for "oneliner".
 
+OUTPUT 3 — "deadline" and "posted_date": dates for the posting, if the input states them.
+- Format both as "YYYY-MM-DD". Return null for either one you cannot fill.
+- "deadline": the application deadline / closing date ("applications close", "apply by", "open until"). NOT a start date, interview date, or program date.
+- "posted_date": the date the job was posted or added.
+- ONLY use a date that is written out in the input. If the input says a relative date ("posted 3 days ago", "closes in two weeks"), return null — you do not know today's date and MUST NOT compute one.
+- If the input gives a month and year but no day, return null rather than guessing a day.
+- Never infer, estimate, or invent a date. Null is always the correct answer when you are unsure.
+
 OUTPUT — return ONLY this JSON, no commentary, no preamble, no code fences:
 {
   "cleaned_markdown": "...",
-  "oneliner": "..." | null
+  "oneliner": "..." | null,
+  "deadline": "YYYY-MM-DD" | null,
+  "posted_date": "YYYY-MM-DD" | null
 }`;
 
 async function postChatCompletion({
@@ -100,6 +114,32 @@ function sanitizeOneliner(s) {
   return v;
 }
 
+// Validate a date string from the LLM. The model is instructed to emit
+// YYYY-MM-DD and to return null rather than guess, but a hallucinated or
+// reformatted date is the obvious failure mode here, so nothing reaches the
+// row that isn't a real calendar date in a plausible range. Round-tripping
+// through Date and comparing the parts back is what rejects 2026-02-31,
+// which Date would otherwise silently roll forward to March 3.
+export function sanitizeIsoDate(s) {
+  if (typeof s !== 'string') return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s.trim());
+  if (!m) return null;
+  const [, y, mo, d] = m.map(Number);
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  if (
+    dt.getUTCFullYear() !== y ||
+    dt.getUTCMonth() !== mo - 1 ||
+    dt.getUTCDate() !== d
+  ) {
+    return null;
+  }
+  // A job posting dated before 2000 or more than two years out is a
+  // hallucination, not a date the JD actually carried.
+  const year = new Date().getUTCFullYear();
+  if (y < 2000 || y > year + 2) return null;
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
 export async function cleanupJd({ rawText, settings }) {
   if (!settings?.apiKey) return { cleanedText: null, skipped: 'no-key' };
   if (!settings?.enabled) return { cleanedText: null, skipped: 'disabled' };
@@ -151,6 +191,8 @@ export async function cleanupJd({ rawText, settings }) {
     return {
       cleanedText,
       oneliner: sanitizeOneliner(parsed?.oneliner),
+      deadline: sanitizeIsoDate(parsed?.deadline),
+      datePosted: sanitizeIsoDate(parsed?.posted_date),
       latencyMs: Math.round(performance.now() - t0),
     };
   } catch (err) {
